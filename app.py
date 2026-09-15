@@ -15,13 +15,15 @@ from database import (
     has_permission, imported_files_df, init_db, insert_records, is_file_imported, list_users_df,
     make_portable_backup_bytes, migrate_v3_payload, read_v3_sqlite_bytes, reset_user_password,
     restore_portable_backup_bytes, safe_database_url, set_settings, term_bounds, thai_academic_year,
-    update_user, today_th,
+    update_user, today_th, timetable_df, timetable_imports_df, import_timetable,
+    recommend_substitutes, add_unavailability, delete_unavailability, unavailability_df,
 )
 from parser_engine import file_sha256, libreoffice_status, parse_document, tesseract_status
 from report_engine import docx_bytes_to_pdf, make_excel, make_substitution_docx, thai_date_long
 from storage import load_file, storage_status, store_file
+from timetable_engine import parse_timetable_file
 
-APP_VERSION = "4.1 FreeCloud"
+APP_VERSION = "4.2 Timetable Assist"
 THAI_MONTHS = {
     0: "ทุกเดือน", 1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน",
     5: "พฤษภาคม", 6: "มิถุนายน", 7: "กรกฎาคม", 8: "สิงหาคม",
@@ -97,7 +99,7 @@ def report_filter(df: pd.DataFrame, settings: dict[str, str]):
 def login_screen() -> None:
     settings = get_settings()
     st.title(f"📚 {settings.get('app_title', 'ระบบนับและสรุปการสอนแทน')}")
-    st.caption("V4.1 FreeCloud — Streamlit Community Cloud / Supabase PostgreSQL / Word-PDF-OCR")
+    st.caption("V4.2 Timetable Assist — Streamlit Community Cloud / Supabase PostgreSQL / Word-PDF-OCR")
     left, center, right = st.columns([1, 1.2, 1])
     with center:
         with st.container(border=True):
@@ -123,7 +125,7 @@ def require_permission(permission: str) -> None:
         st.stop()
 
 
-st.set_page_config(page_title="ระบบนับการสอนแทน V4.1", page_icon="📚", layout="wide")
+st.set_page_config(page_title="ระบบนับการสอนแทน V4.2", page_icon="📚", layout="wide")
 try:
     init_db()
 except Exception as exc:
@@ -145,7 +147,7 @@ st.markdown(
 for key, default in {
     "user": None,
     "batch_records": [], "batch_file_hashes": {}, "batch_warnings": {}, "batch_file_bytes": {},
-    "last_pdf": None,
+    "last_pdf": None, "timetable_preview": None, "timetable_preview_meta": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -184,7 +186,7 @@ settings = get_settings()
 st.title(f"📚 {settings.get('app_title', 'ระบบนับและสรุปการสอนแทน')}")
 st.caption(f"เวอร์ชัน {APP_VERSION} | ฐานข้อมูล {database_kind()} | ไม่ใช้ Generative AI ในการอ่านเอกสาร")
 
-menu = ["แดชบอร์ด", "รายงาน / พิมพ์", "ข้อมูลทั้งหมด", "นำเข้า / ส่งออก", "บัญชีของฉัน"]
+menu = ["แดชบอร์ด", "ช่วยจัดครูสอนแทน", "รายงาน / พิมพ์", "ข้อมูลทั้งหมด", "นำเข้า / ส่งออก", "บัญชีของฉัน"]
 if has_permission(role, "upload"):
     menu.insert(0, "อัปโหลด Word/PDF")
 if has_permission(role, "manual"):
@@ -195,7 +197,7 @@ if has_permission(role, "users"):
     menu.append("ผู้ใช้งาน / Audit")
 
 with st.sidebar:
-    st.markdown("<span class='online-badge'>● FreeCloud V4.1</span>", unsafe_allow_html=True)
+    st.markdown("<span class='online-badge'>● FreeCloud V4.2</span>", unsafe_allow_html=True)
     st.subheader(user.get("display_name") or username)
     st.caption(f"{ROLE_LABELS.get(role, role)} · @{username}")
     page = st.radio("เมนู", menu, label_visibility="collapsed")
@@ -350,6 +352,208 @@ if page == "อัปโหลด Word/PDF":
             st.session_state.batch_file_hashes = {}
             st.session_state.batch_warnings = {}
             st.session_state.batch_file_bytes = {}
+
+
+elif page == "ช่วยจัดครูสอนแทน":
+    st.subheader("🧑‍🏫 ช่วยจัดครูสอนแทน")
+    st.caption("ตรวจครูที่ว่างจากตารางสอนจริง แล้วเรียงคำแนะนำโดยคำนึงถึงความเป็นธรรม ภาระสอน และประสบการณ์ในวิชา")
+
+    tab_help, tab_import, tab_unavailable, tab_view = st.tabs([
+        "ช่วยเลือกครู", "นำเข้าตารางสอน", "ครูไม่ว่าง/ติดภารกิจ", "ดูตารางสอน"
+    ])
+
+    with tab_help:
+        c1, c2, c3 = st.columns(3)
+        work_date = c1.date_input("วันที่ต้องจัดสอนแทน", value=today_th(), key="assist_date")
+        default_ay = thai_academic_year(work_date, settings.get("academic_year_start", "05-01"))
+        ay = c2.number_input("ปีการศึกษา (พ.ศ.)", min_value=2500, max_value=2700, value=int(default_ay), step=1, key="assist_ay")
+        term = c3.selectbox("ภาคเรียน", [1, 2], key="assist_term", format_func=lambda x: f"ภาคเรียนที่ {x}")
+
+        tt = timetable_df(int(ay), int(term))
+        if tt.empty:
+            st.info("ยังไม่มีตารางสอนสำหรับปีการศึกษา/ภาคเรียนนี้ กรุณาเปิดแท็บ 'นำเข้าตารางสอน' ก่อน")
+        else:
+            weekday = DAY_NAMES[work_date.weekday()]
+            day_tt = tt[tt["weekday"].astype(str) == weekday].copy()
+            teachers = sorted(x for x in tt["teacher"].dropna().astype(str).str.strip().unique() if x and "ลส.-" not in x and "สำรอง" not in x)
+            if work_date.weekday() >= 5:
+                st.warning("วันที่เลือกเป็นวันเสาร์/อาทิตย์ ตารางต้นฉบับมีเฉพาะวันจันทร์–ศุกร์")
+            absent = st.selectbox("ครูที่ไม่สามารถเข้าสอนได้", [""] + teachers, key="assist_absent")
+
+            selected_period = None
+            selected_subject = ""
+            selected_class = ""
+            if absent:
+                own = day_tt[day_tt["teacher"].astype(str).str.strip() == absent].copy()
+                if not own.empty:
+                    own = own.sort_values(["period", "class_name", "subject"])
+                    own["label"] = own.apply(lambda r: f"คาบ {int(r['period'])} | {r['subject']} | {r['class_name']}", axis=1)
+                    labels = own["label"].tolist()
+                    chosen_label = st.selectbox("คาบของครูที่ต้องจัดสอนแทน", labels, key="assist_assignment")
+                    chosen = own[own["label"] == chosen_label].iloc[0]
+                    selected_period = int(chosen["period"])
+                    selected_subject = str(chosen["subject"])
+                    selected_class = str(chosen["class_name"])
+                else:
+                    st.warning(f"ไม่พบคาบสอนของ {absent} ในวัน{weekday} — สามารถระบุคาบเองได้")
+                    cc1, cc2, cc3 = st.columns(3)
+                    selected_period = int(cc1.number_input("คาบ", min_value=1, max_value=8, value=1, step=1, key="assist_period_manual"))
+                    selected_subject = cc2.text_input("วิชา", key="assist_subject_manual")
+                    selected_class = cc3.text_input("ชั้น", key="assist_class_manual")
+
+            if absent and selected_period:
+                st.markdown(f"**รายการ:** วัน{weekday} · คาบ {selected_period} · {selected_subject or '-'} · {selected_class or '-'}")
+                ranked = recommend_substitutes(
+                    work_date.isoformat(), int(ay), int(term), int(selected_period), absent, selected_subject, True
+                )
+                if ranked.empty:
+                    st.warning("ยังไม่พบข้อมูลครูสำหรับจัดอันดับ")
+                else:
+                    eligible = ranked[ranked["eligible"] == True].copy()
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("ครูว่าง", len(eligible))
+                    c2.metric("ครูมีสอน/ไม่ว่าง", len(ranked) - len(eligible))
+                    c3.metric("คำแนะนำอันดับ 1", eligible.iloc[0]["teacher"] if not eligible.empty else "ไม่มี")
+
+                    show = ranked.rename(columns={
+                        "teacher": "ครู", "status": "สถานะ", "substitute_count": "สอนแทนสะสม",
+                        "daily_load": "คาบสอนวันนี้", "subject_match": "ความถนัด",
+                    })
+                    st.dataframe(show[["ครู", "สถานะ", "สอนแทนสะสม", "คาบสอนวันนี้", "ความถนัด"]], use_container_width=True, hide_index=True)
+
+                    if not eligible.empty:
+                        st.caption("ระบบเรียงจากจำนวนสอนแทนสะสมน้อยก่อน จากนั้นดูภาระสอนในวันนั้น และให้โบนัสเล็กน้อยกับครูที่เคยสอนวิชาเดียวกัน")
+                        pick = st.selectbox("เลือกครูผู้สอนแทน", eligible["teacher"].tolist(), key="assist_pick")
+                        leave = st.selectbox("ประเภทการลา/เหตุ", ["ลากิจ", "ลาป่วย", "ไปราชการ", "ลาคลอด", "ไม่ระบุ"], key="assist_leave")
+                        note = st.text_input("หมายเหตุ", value="ทำใบงาน", key="assist_note")
+                        if has_permission(role, "manual"):
+                            if st.button("ยืนยันและบันทึกการสอนแทน", type="primary", key="assist_save"):
+                                r = normalize_record({
+                                    "date_iso": work_date.isoformat(), "absent_teacher": absent, "leave_type": leave,
+                                    "period": selected_period, "subject": selected_subject, "class_name": selected_class,
+                                    "substitute_teacher": pick, "acknowledged": "", "note": note,
+                                    "source_file": "ระบบช่วยจัดครูสอนแทน", "confidence": "ตารางสอน", "import_method": "scheduler",
+                                })
+                                source_hash = f"scheduler-{work_date.isoformat()}-{absent}-{selected_period}-{pick}"
+                                added, skipped = insert_records([r], source_hash, "ระบบช่วยจัดครูสอนแทน", "scheduler", username=username)
+                                if added:
+                                    st.success("บันทึกการสอนแทนเรียบร้อย")
+                                    st.rerun()
+                                else:
+                                    st.warning("รายการนี้อาจถูกบันทึกไว้แล้ว หรือข้อมูลสำคัญไม่ครบ")
+                        else:
+                            st.info("บัญชีนี้ดูคำแนะนำได้ แต่ไม่มีสิทธิ์บันทึกรายการ")
+
+    with tab_import:
+        if not has_permission(role, "timetable"):
+            st.info("เฉพาะผู้ดูแลระบบ/ฝ่ายวิชาการเท่านั้นที่นำเข้าตารางสอนได้")
+        else:
+            st.write("รองรับไฟล์ต้นฉบับรูปแบบ `.xlsm` นี้โดยตรง ระบบอ่านค่าที่บันทึกไว้จากชีต `ข้อมูลครูผู้สอน` และ `ลงตาราง` โดยไม่แกะรหัส VBA")
+            c1, c2 = st.columns(2)
+            imp_ay = c1.number_input("ปีการศึกษา", min_value=2500, max_value=2700, value=int(today_th().year + 543), step=1, key="tt_imp_ay")
+            imp_term = c2.selectbox("ภาคเรียน", [1, 2], key="tt_imp_term", format_func=lambda x: f"ภาคเรียนที่ {x}")
+            tt_file = st.file_uploader("เลือกไฟล์ตารางสอน", type=["xlsm", "xlsx", "xls"], key="tt_file")
+            if tt_file is not None and st.button("1) อ่านและตรวจสอบตารางสอน", type="primary", key="tt_read"):
+                raw = tt_file.getvalue()
+                suffix = Path(tt_file.name).suffix.lower()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                try:
+                    parsed = parse_timetable_file(tmp_path)
+                    fh = file_sha256(tmp_path)
+                    st.session_state.timetable_preview = parsed
+                    st.session_state.timetable_preview_meta = {
+                        "file_name": tt_file.name, "file_hash": fh, "academic_year": int(imp_ay), "term": int(imp_term)
+                    }
+                except Exception as exc:
+                    st.session_state.timetable_preview = None
+                    st.session_state.timetable_preview_meta = None
+                    st.error(f"อ่านตารางสอนไม่สำเร็จ: {exc}")
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+            preview = st.session_state.get("timetable_preview")
+            meta = st.session_state.get("timetable_preview_meta")
+            if preview and meta:
+                stats = preview.get("stats", {})
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("ครู", stats.get("teachers", 0))
+                c2.metric("รายการครู-คาบ", stats.get("entries", 0))
+                c3.metric("วัน", stats.get("days", 0))
+                c4.metric("ชั้น", stats.get("classes", 0))
+                pdf = pd.DataFrame(preview.get("entries", []))
+                if not pdf.empty:
+                    display = pdf.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู", "teacher_slot":"ครูคนที่"})
+                    st.dataframe(display[["วัน", "คาบ", "ชั้น", "วิชา", "ครู", "ครูคนที่"]].head(300), use_container_width=True, hide_index=True)
+                warnings = preview.get("warnings", [])
+                if warnings:
+                    with st.expander(f"คำเตือน {len(warnings)} รายการ"):
+                        for w in warnings[:100]:
+                            st.warning(w)
+                st.warning(f"เมื่อยืนยัน ระบบจะแทนที่ตารางสอนเดิมของปีการศึกษา {meta['academic_year']} ภาคเรียนที่ {meta['term']} เท่านั้น")
+                if st.button("2) ยืนยันนำเข้าตารางสอน", type="primary", key="tt_confirm"):
+                    n = import_timetable(
+                        preview.get("entries", []), meta["academic_year"], meta["term"], meta["file_hash"], meta["file_name"],
+                        teacher_count=stats.get("teachers", 0), warning_text=" | ".join(warnings), username=username,
+                    )
+                    st.success(f"นำเข้าตารางสอนแล้ว {n} รายการ")
+                    st.session_state.timetable_preview = None
+                    st.session_state.timetable_preview_meta = None
+                    st.rerun()
+
+            hist = timetable_imports_df()
+            if not hist.empty:
+                st.markdown("#### ประวัตินำเข้าตารางสอน")
+                st.dataframe(hist[[c for c in ["file_name", "academic_year", "term", "row_count", "teacher_count", "imported_at", "uploaded_by"] if c in hist.columns]], use_container_width=True, hide_index=True)
+
+    with tab_unavailable:
+        tta = timetable_df()
+        teacher_choices = sorted(x for x in tta["teacher"].dropna().astype(str).str.strip().unique() if x and "ลส.-" not in x and "สำรอง" not in x) if not tta.empty else []
+        d = st.date_input("วันที่", value=today_th(), key="ua_date")
+        if has_permission(role, "timetable"):
+            with st.form("ua_add"):
+                c1, c2, c3 = st.columns(3)
+                teacher = c1.selectbox("ครู", teacher_choices, key="ua_teacher") if teacher_choices else c1.text_input("ครู")
+                period = c2.selectbox("ช่วงเวลา", [0,1,2,3,4,5,6,7,8], format_func=lambda x: "ทั้งวัน" if x == 0 else f"คาบ {x}")
+                reason = c3.text_input("เหตุผล/ภารกิจ")
+                add_ok = st.form_submit_button("เพิ่มรายการไม่ว่าง")
+            if add_ok:
+                add_unavailability(d.isoformat(), teacher, int(period), reason, username=username)
+                st.success("บันทึกแล้ว")
+                st.rerun()
+        ua = unavailability_df(d.isoformat())
+        if ua.empty:
+            st.caption("ยังไม่มีรายการครูไม่ว่าง/ติดภารกิจในวันนี้")
+        else:
+            show = ua.copy()
+            show["ช่วงเวลา"] = show["period"].apply(lambda x: "ทั้งวัน" if int(x or 0) == 0 else f"คาบ {int(x)}")
+            st.dataframe(show[["id", "teacher", "ช่วงเวลา", "reason", "created_by"]], use_container_width=True, hide_index=True)
+            if has_permission(role, "timetable"):
+                ids = st.multiselect("เลือก ID ที่ต้องการลบ", show["id"].astype(int).tolist(), key="ua_del_ids")
+                if st.button("ลบรายการที่เลือก", disabled=not ids, key="ua_del"):
+                    delete_unavailability(ids, username=username)
+                    st.rerun()
+
+    with tab_view:
+        all_tt = timetable_df()
+        if all_tt.empty:
+            st.info("ยังไม่มีตารางสอนในฐานข้อมูล")
+        else:
+            years = sorted(all_tt["academic_year"].astype(int).unique(), reverse=True)
+            c1, c2, c3 = st.columns(3)
+            vy = c1.selectbox("ปีการศึกษา", years, key="view_tt_ay")
+            terms = sorted(all_tt.loc[all_tt["academic_year"].astype(int) == int(vy), "term"].astype(int).unique())
+            vt = c2.selectbox("ภาคเรียน", terms, key="view_tt_term")
+            vday = c3.selectbox("วัน", ["ทั้งหมด"] + DAY_NAMES[:5], key="view_tt_day")
+            view = timetable_df(int(vy), int(vt))
+            if vday != "ทั้งหมด":
+                view = view[view["weekday"] == vday]
+            show = view.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู"})
+            st.dataframe(show[["วัน", "คาบ", "ชั้น", "วิชา", "ครู"]], use_container_width=True, hide_index=True)
 
 
 elif page == "แดชบอร์ด":
@@ -770,3 +974,5 @@ elif page == "บัญชีของฉัน":
                 st.success("เปลี่ยนรหัสผ่านเรียบร้อย")
             except Exception as exc:
                 st.error(str(exc))
+
+
