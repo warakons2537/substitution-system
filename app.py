@@ -1,978 +1,825 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
+import json
 import os
-import shutil
+import secrets
+import sqlite3
 import tempfile
+import zipfile
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
+from typing import Iterable, Optional
 
 import pandas as pd
-import streamlit as st
-
-from database import (
-    COLS, ROLE_LABELS, academic_year_bounds, audit_df, authenticate_user, change_own_password,
-    clear_sample_records, create_user, database_kind, delete_records, df_all, get_settings,
-    has_permission, imported_files_df, init_db, insert_records, is_file_imported, list_users_df,
-    make_portable_backup_bytes, migrate_v3_payload, read_v3_sqlite_bytes, reset_user_password,
-    restore_portable_backup_bytes, safe_database_url, set_settings, term_bounds, thai_academic_year,
-    update_user, today_th, timetable_df, timetable_imports_df, import_timetable,
-    recommend_substitutes, add_unavailability, delete_unavailability, unavailability_df,
+from sqlalchemy import (
+    Boolean, Column, Integer, MetaData, String, Table, Text, create_engine, delete,
+    insert, select, update,
 )
-from parser_engine import file_sha256, libreoffice_status, parse_document, tesseract_status
-from report_engine import docx_bytes_to_pdf, make_excel, make_substitution_docx, thai_date_long
-from storage import load_file, storage_status, store_file
-from timetable_engine import parse_timetable_file
+from sqlalchemy.exc import IntegrityError
 
-APP_VERSION = "4.2 Timetable Assist"
-THAI_MONTHS = {
-    0: "ทุกเดือน", 1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน",
-    5: "พฤษภาคม", 6: "มิถุนายน", 7: "กรกฎาคม", 8: "สิงหาคม",
-    9: "กันยายน", 10: "ตุลาคม", 11: "พฤศจิกายน", 12: "ธันวาคม",
+from parser_engine import record_fingerprint
+
+APP_DIR = Path(__file__).resolve().parent
+LOCAL_DB_PATH = APP_DIR / "substitution_v4.db"
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{LOCAL_DB_PATH}")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL.startswith("postgresql://") and "+" not in DATABASE_URL.split("://", 1)[0]:
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
+
+engine_kwargs = {"pool_pre_ping": True}
+if DATABASE_URL.startswith("sqlite:"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+elif DATABASE_URL.startswith("postgresql"):
+    # Keep a small pool: friendly to Supabase Free / shared pooler limits.
+    engine_kwargs.update(pool_size=3, max_overflow=2, pool_recycle=300, pool_timeout=15)
+    if "supabase.com" in DATABASE_URL and "sslmode=" not in DATABASE_URL:
+        engine_kwargs["connect_args"] = {"sslmode": "require", "connect_timeout": 10}
+ENGINE = create_engine(DATABASE_URL, future=True, **engine_kwargs)
+metadata = MetaData()
+
+records = Table(
+    "records", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("date_iso", String(10), nullable=False),
+    Column("day_name", String(32), default=""),
+    Column("thai_year", Integer, default=0),
+    Column("absent_teacher", Text, default=""),
+    Column("leave_type", String(64), default=""),
+    Column("period", Integer, default=0),
+    Column("subject", Text, default=""),
+    Column("class_name", String(64), default=""),
+    Column("substitute_teacher", Text, default=""),
+    Column("acknowledged", String(128), default=""),
+    Column("note", Text, default=""),
+    Column("source_file", Text, default=""),
+    Column("source_hash", String(128), default=""),
+    Column("record_hash", String(128), unique=True, nullable=False),
+    Column("imported_at", String(40), default=""),
+    Column("confidence", String(128), default=""),
+    Column("import_method", String(64), default=""),
+    Column("created_by", String(128), default=""),
+)
+
+imported_files = Table(
+    "imported_files", metadata,
+    Column("file_hash", String(128), primary_key=True),
+    Column("file_name", Text, default=""),
+    Column("imported_at", String(40), default=""),
+    Column("imported_rows", Integer, default=0),
+    Column("import_method", String(64), default=""),
+    Column("warning_text", Text, default=""),
+    Column("storage_key", Text, default=""),
+    Column("uploaded_by", String(128), default=""),
+)
+
+settings_table = Table(
+    "settings", metadata,
+    Column("key", String(128), primary_key=True),
+    Column("value", Text, default=""),
+)
+
+users = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String(128), unique=True, nullable=False),
+    Column("password_hash", Text, nullable=False),
+    Column("display_name", Text, default=""),
+    Column("role", String(32), default="viewer"),
+    Column("active", Boolean, default=True),
+    Column("created_at", String(40), default=""),
+    Column("last_login", String(40), default=""),
+    Column("must_change_password", Boolean, default=False),
+)
+
+audit_logs = Table(
+    "audit_logs", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("occurred_at", String(40), default=""),
+    Column("username", String(128), default=""),
+    Column("action", String(128), default=""),
+    Column("entity_type", String(64), default=""),
+    Column("entity_id", String(128), default=""),
+    Column("detail", Text, default=""),
+)
+
+# ตารางสอนสำหรับโมดูลช่วยจัดครูสอนแทน
+timetable_entries = Table(
+    "timetable_entries", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("academic_year", Integer, nullable=False),
+    Column("term", Integer, nullable=False),
+    Column("weekday", String(32), nullable=False),
+    Column("period", Integer, nullable=False),
+    Column("class_name", String(64), default=""),
+    Column("subject", Text, default=""),
+    Column("teacher", Text, nullable=False),
+    Column("teacher_slot", Integer, default=1),
+    Column("source_hash", String(128), default=""),
+    Column("imported_at", String(40), default=""),
+)
+
+timetable_imports = Table(
+    "timetable_imports", metadata,
+    Column("file_hash", String(128), primary_key=True),
+    Column("file_name", Text, default=""),
+    Column("academic_year", Integer, nullable=False),
+    Column("term", Integer, nullable=False),
+    Column("imported_at", String(40), default=""),
+    Column("row_count", Integer, default=0),
+    Column("teacher_count", Integer, default=0),
+    Column("warning_text", Text, default=""),
+    Column("uploaded_by", String(128), default=""),
+)
+
+teacher_unavailability = Table(
+    "teacher_unavailability", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("date_iso", String(10), nullable=False),
+    Column("teacher", Text, nullable=False),
+    Column("period", Integer, default=0),
+    Column("reason", Text, default=""),
+    Column("created_by", String(128), default=""),
+    Column("created_at", String(40), default=""),
+)
+
+COLS = [
+    "date_iso", "day_name", "thai_year", "absent_teacher", "leave_type", "period",
+    "subject", "class_name", "substitute_teacher", "acknowledged", "note", "source_file",
+]
+
+SAMPLE_ROWS = [
+    ("2026-07-07","อังคาร",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",3,"ภาษาอังกฤษ","ม.1","ครูวีระยุทธ์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-07","อังคาร",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",4,"ภาษาอังกฤษ","ม.3","ครูวีระยุทธ์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-07","อังคาร",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",5,"เสริมทักษะภาษาอังกฤษ","ป.5","ครูพศิน","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-08","พุธ",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",1,"ภาษาอังกฤษ","ม.3","ครูวีระยุทธ์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-08","พุธ",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",2,"ภาษาอังกฤษพื้นฐาน","ป.6","ครูพศิน","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-08","พุธ",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",4,"ภาษาอังกฤษ","ม.1","ครูปิยะพร","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-08","พุธ",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",5,"ภาษาอังกฤษ","ม.2","ครูสุรรัตน์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-09","พฤหัสบดี",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",1,"เสริมทักษะอังกฤษ","ป.5","ครูอุสา","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-09","พฤหัสบดี",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",2,"ภาษาอังกฤษพื้นฐาน","ป.5","ครูภัคพิชา","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-09","พฤหัสบดี",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",3,"เสริมทักษะอังกฤษ","ป.6","ครูพศิน","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-09","พฤหัสบดี",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",4,"เสริมทักษะอังกฤษ","ป.6","ครูอุสา","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-10","ศุกร์",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",2,"คอมพิวเตอร์","ม.3","ครูวีระยุทธ์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-10","ศุกร์",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",3,"คอมพิวเตอร์","ม.2","ครูพราภรณ์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-10","ศุกร์",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",4,"ภาษาอังกฤษ","ม.2","ครูวิวัฒน์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+    ("2026-07-10","ศุกร์",2569,"นายวรากร ตรงต่อกิจ","ลากิจ",5,"การป้องกันการทุจริต","ป.5","ครูสุทธวีร์","","ทำใบงาน","ใบลากิจ 7 - 10 กค.doc"),
+]
+
+BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
+
+DEFAULT_SETTINGS = {
+    "school_name": "โรงเรียนบ้านวังลึก(ยุวนาฏชนูทิศ)",
+    "academic_head_name": "นางเจษฎ์สุดา ขำพงศ์",
+    "director_name": "นายอัครวีร กระแสร์",
+    "academic_year_start": "05-01",
+    "term1_end": "10-31",
+    "term2_start": "11-01",
+    "term2_end": "04-30",
+    "periods_per_day": "6",
+    "seed_sample": os.getenv("SEED_SAMPLE_DATA", "0"),
+    "app_title": "ระบบนับและสรุปการสอนแทน",
 }
-DAY_NAMES = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+
+ROLE_LABELS = {"admin": "ผู้ดูแลระบบ", "academic": "ฝ่ายวิชาการ", "viewer": "ผู้ดูข้อมูล"}
+PERMISSIONS = {
+    "admin": {"upload", "manual", "delete", "export", "settings", "users", "restore", "view", "report", "timetable"},
+    "academic": {"upload", "manual", "delete", "export", "view", "report", "timetable"},
+    "viewer": {"export", "view", "report"},
+}
 
 
-def normalize_record(r: dict) -> dict:
-    out = dict(r)
-    raw_date = str(out.get("date_iso", "")).strip()
+def now_iso() -> str:
+    return datetime.now(BANGKOK_TZ).isoformat(timespec="seconds")
+
+
+def today_th() -> date:
+    return datetime.now(BANGKOK_TZ).date()
+
+
+def database_kind() -> str:
+    return "PostgreSQL" if DATABASE_URL.startswith("postgresql") else "SQLite"
+
+
+def safe_database_url() -> str:
+    if "@" in DATABASE_URL and "://" in DATABASE_URL:
+        prefix, rest = DATABASE_URL.split("://", 1)
+        if "@" in rest:
+            creds, host = rest.rsplit("@", 1)
+            user = creds.split(":", 1)[0]
+            return f"{prefix}://{user}:***@{host}"
+    return DATABASE_URL
+
+
+def has_permission(role: str, permission: str) -> bool:
+    return permission in PERMISSIONS.get(role or "viewer", set())
+
+
+def _hash_password(password: str, iterations: int = 260_000) -> str:
+    if len(password) < 8:
+        raise ValueError("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def _verify_password(password: str, encoded: str) -> bool:
     try:
-        d = date.fromisoformat(raw_date[:10])
-        out["date_iso"] = d.isoformat()
-        out["day_name"] = DAY_NAMES[d.weekday()]
-        out["thai_year"] = d.year + 543
+        algo, iters, salt_b64, digest_b64 = encoded.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_b64.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iters))
+        return secrets.compare_digest(actual, expected)
     except Exception:
-        out["date_iso"] = ""
-        out["day_name"] = ""
-        out["thai_year"] = 0
-    try:
-        out["period"] = int(float(out.get("period") or 0))
-    except Exception:
-        out["period"] = 0
-    for c in [
-        "absent_teacher", "leave_type", "subject", "class_name", "substitute_teacher",
-        "acknowledged", "note", "source_file", "confidence", "import_method",
-    ]:
-        out[c] = str(out.get(c, "") or "").strip()
+        return False
+
+
+def audit_event(username: str, action: str, entity_type: str = "", entity_id: str = "", detail: object = "") -> None:
+    if not isinstance(detail, str):
+        try:
+            detail = json.dumps(detail, ensure_ascii=False, default=str)
+        except Exception:
+            detail = str(detail)
+    with ENGINE.begin() as con:
+        con.execute(insert(audit_logs).values(
+            occurred_at=now_iso(), username=username or "system", action=action,
+            entity_type=entity_type, entity_id=str(entity_id or ""), detail=str(detail or ""),
+        ))
+
+
+def init_db(seed_if_empty: bool = True) -> None:
+    metadata.create_all(ENGINE)
+    with ENGINE.begin() as con:
+        for key, value in DEFAULT_SETTINGS.items():
+            if con.execute(select(settings_table.c.key).where(settings_table.c.key == key)).first() is None:
+                con.execute(insert(settings_table).values(key=key, value=value))
+
+        user_count = con.execute(select(users.c.id)).first()
+        if user_count is None:
+            username = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "admin").strip() or "admin"
+            password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+            freecloud = os.getenv("FREECLOUD_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+            if not password:
+                if freecloud:
+                    raise RuntimeError(
+                        "ยังไม่ได้ตั้ง BOOTSTRAP_ADMIN_PASSWORD ใน Streamlit Secrets "
+                        "กรุณาตั้งรหัสผ่าน Admin ก่อนเปิดระบบครั้งแรก"
+                    )
+                password = "Admin@12345"
+            display_name = os.getenv("BOOTSTRAP_ADMIN_NAME", "ผู้ดูแลระบบ")
+            con.execute(insert(users).values(
+                username=username,
+                password_hash=_hash_password(password),
+                display_name=display_name,
+                role="admin",
+                active=True,
+                created_at=now_iso(),
+                last_login="",
+                must_change_password=True,
+            ))
+
+        record_count = con.execute(select(records.c.id)).first()
+        seed_pref = con.execute(select(settings_table.c.value).where(settings_table.c.key == "seed_sample")).first()
+        allow_seed = bool(seed_pref and str(seed_pref[0]) == "1")
+        if seed_if_empty and record_count is None and allow_seed:
+            for row in SAMPLE_ROWS:
+                rec = dict(zip(COLS, row))
+                rh = record_fingerprint(rec)
+                vals = dict(rec)
+                vals.update(
+                    source_hash="sample-seed", record_hash=rh, imported_at=now_iso(),
+                    confidence="ตัวอย่าง", import_method="sample", created_by="system",
+                )
+                exists_record = con.execute(select(records.c.id).where(records.c.record_hash == rh)).first()
+                if not exists_record:
+                    con.execute(insert(records).values(**vals))
+
+
+def get_settings() -> dict[str, str]:
+    with ENGINE.connect() as con:
+        rows = con.execute(select(settings_table.c.key, settings_table.c.value)).all()
+    out = DEFAULT_SETTINGS.copy()
+    out.update({str(k): str(v) for k, v in rows})
     return out
 
 
-def report_filter(df: pd.DataFrame, settings: dict[str, str]):
-    if df.empty:
-        return df, {}
-    work = df.copy()
-    work["_date"] = pd.to_datetime(work["date_iso"], errors="coerce").dt.date
-    work = work[work["_date"].notna()].copy()
-    work["_academic_year"] = work["_date"].map(
-        lambda d: thai_academic_year(d, settings.get("academic_year_start", "05-01"))
+def set_settings(values: dict[str, object], username: str = "system") -> None:
+    with ENGINE.begin() as con:
+        for key, value in values.items():
+            exists = con.execute(select(settings_table.c.key).where(settings_table.c.key == str(key))).first()
+            if exists:
+                con.execute(update(settings_table).where(settings_table.c.key == str(key)).values(value=str(value)))
+            else:
+                con.execute(insert(settings_table).values(key=str(key), value=str(value)))
+    audit_event(username, "settings.update", "settings", "", values)
+
+
+def df_all() -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        return pd.read_sql(select(records).order_by(records.c.date_iso.desc(), records.c.period.asc(), records.c.id.desc()), con)
+
+
+def imported_files_df() -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        return pd.read_sql(select(imported_files).order_by(imported_files.c.imported_at.desc()), con)
+
+
+def audit_df(limit: int = 1000) -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        stmt = select(audit_logs).order_by(audit_logs.c.id.desc()).limit(int(limit))
+        return pd.read_sql(stmt, con)
+
+
+def is_file_imported(file_hash: str):
+    with ENGINE.connect() as con:
+        row = con.execute(select(
+            imported_files.c.file_name, imported_files.c.imported_at,
+            imported_files.c.imported_rows, imported_files.c.import_method,
+            imported_files.c.storage_key,
+        ).where(imported_files.c.file_hash == file_hash)).first()
+    return tuple(row) if row else None
+
+
+def insert_records(
+    recs: list[dict], source_hash: str, source_name: str, import_method: str = "manual",
+    warning_text: str = "", storage_key: str = "", username: str = "system",
+) -> tuple[int, int]:
+    now = now_iso()
+    added = skipped = 0
+    with ENGINE.begin() as con:
+        for r in recs:
+            if not r.get("date_iso") or not r.get("absent_teacher") or not r.get("substitute_teacher"):
+                skipped += 1
+                continue
+            try:
+                period = int(float(r.get("period") or 0))
+            except Exception:
+                period = 0
+            if period <= 0:
+                skipped += 1
+                continue
+            r = dict(r)
+            r["period"] = period
+            rh = record_fingerprint(r)
+            vals = {k: r.get(k, "") for k in COLS}
+            vals.update(
+                source_hash=source_hash,
+                record_hash=rh,
+                imported_at=now,
+                confidence=str(r.get("confidence", "")),
+                import_method=str(r.get("import_method") or import_method),
+                created_by=username or "system",
+            )
+            exists_record = con.execute(select(records.c.id).where(records.c.record_hash == rh)).first()
+            if exists_record:
+                skipped += 1
+            else:
+                try:
+                    with con.begin_nested():
+                        con.execute(insert(records).values(**vals))
+                    added += 1
+                except IntegrityError:
+                    skipped += 1
+
+        exists = con.execute(select(imported_files.c.file_hash).where(imported_files.c.file_hash == source_hash)).first()
+        file_vals = dict(
+            file_name=source_name, imported_at=now, imported_rows=added,
+            import_method=import_method, warning_text=warning_text,
+            storage_key=storage_key, uploaded_by=username or "system",
+        )
+        if exists:
+            con.execute(update(imported_files).where(imported_files.c.file_hash == source_hash).values(**file_vals))
+        else:
+            con.execute(insert(imported_files).values(file_hash=source_hash, **file_vals))
+    audit_event(username, "records.import", "file", source_hash, {"file": source_name, "added": added, "skipped": skipped, "method": import_method})
+    return added, skipped
+
+
+def delete_records(ids: Iterable[int], username: str = "system") -> int:
+    ids = [int(x) for x in ids]
+    if not ids:
+        return 0
+    with ENGINE.begin() as con:
+        result = con.execute(delete(records).where(records.c.id.in_(ids)))
+        n = int(result.rowcount or 0)
+    audit_event(username, "records.delete", "record", ",".join(map(str, ids)), {"count": n})
+    return n
+
+
+def clear_sample_records(username: str = "system") -> int:
+    with ENGINE.begin() as con:
+        result = con.execute(delete(records).where(records.c.source_hash == "sample-seed"))
+        n = int(result.rowcount or 0)
+        con.execute(update(settings_table).where(settings_table.c.key == "seed_sample").values(value="0"))
+    audit_event(username, "sample.clear", "record", "sample-seed", {"count": n})
+    return n
+
+
+def create_user(username: str, password: str, display_name: str, role: str = "viewer", created_by: str = "system", must_change_password: bool = True) -> int:
+    username = username.strip().lower()
+    if not username:
+        raise ValueError("กรุณาระบุชื่อผู้ใช้")
+    if role not in ROLE_LABELS:
+        raise ValueError("สิทธิ์ผู้ใช้ไม่ถูกต้อง")
+    vals = dict(
+        username=username, password_hash=_hash_password(password), display_name=display_name.strip(),
+        role=role, active=True, created_at=now_iso(), last_login="",
+        must_change_password=bool(must_change_password),
     )
-    years = sorted([int(x) for x in work["_academic_year"].dropna().unique()], reverse=True)
-    if not years:
-        years = [today_th().year + 543]
-
-    c1, c2, c3 = st.columns(3)
-    ay = c1.selectbox("ปีการศึกษา", years, index=0)
-    term_label = c2.selectbox("ภาคเรียน", ["ทั้งหมด", "ภาคเรียนที่ 1", "ภาคเรียนที่ 2"])
-    month = c3.selectbox("เดือน", list(THAI_MONTHS.keys()), format_func=lambda x: THAI_MONTHS[x])
-
-    start, end = academic_year_bounds(ay, settings)
-    if term_label == "ภาคเรียนที่ 1":
-        start, end = term_bounds(ay, 1, settings)
-    elif term_label == "ภาคเรียนที่ 2":
-        start, end = term_bounds(ay, 2, settings)
-
-    f = work[(work["_date"] >= start) & (work["_date"] <= end)].copy()
-    if month:
-        f = f[f["_date"].map(lambda d: d.month == month)]
-
-    c4, c5 = st.columns(2)
-    subs = ["ทั้งหมด"] + sorted(x for x in f["substitute_teacher"].dropna().astype(str).unique() if x.strip())
-    absents = ["ทั้งหมด"] + sorted(x for x in f["absent_teacher"].dropna().astype(str).unique() if x.strip())
-    sub = c4.selectbox("ผู้สอนแทน", subs)
-    absent = c5.selectbox("ครูประจำวิชา/คนลา", absents)
-    if sub != "ทั้งหมด":
-        f = f[f["substitute_teacher"] == sub]
-    if absent != "ทั้งหมด":
-        f = f[f["absent_teacher"] == absent]
-    return f, {"academic_year": ay, "term": term_label, "month": month, "start": start, "end": end}
+    try:
+        with ENGINE.begin() as con:
+            result = con.execute(insert(users).values(**vals))
+            user_id = int(result.inserted_primary_key[0])
+    except IntegrityError as exc:
+        raise ValueError("ชื่อผู้ใช้นี้มีอยู่แล้ว") from exc
+    audit_event(created_by, "user.create", "user", username, {"role": role, "display_name": display_name})
+    return user_id
 
 
-def login_screen() -> None:
-    settings = get_settings()
-    st.title(f"📚 {settings.get('app_title', 'ระบบนับและสรุปการสอนแทน')}")
-    st.caption("V4.2 Timetable Assist — Streamlit Community Cloud / Supabase PostgreSQL / Word-PDF-OCR")
-    left, center, right = st.columns([1, 1.2, 1])
-    with center:
-        with st.container(border=True):
-            st.subheader("เข้าสู่ระบบ")
-            with st.form("login_form"):
-                username = st.text_input("ชื่อผู้ใช้")
-                password = st.text_input("รหัสผ่าน", type="password")
-                ok = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
-            if ok:
-                user = authenticate_user(username, password)
-                if user:
-                    st.session_state.user = user
-                    st.rerun()
-                else:
-                    st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
-            st.caption("บัญชี Admin ครั้งแรกกำหนดผ่าน Streamlit Secrets และระบบจะบังคับเปลี่ยนรหัสผ่านหลังเข้าสู่ระบบ")
+def authenticate_user(username: str, password: str) -> Optional[dict]:
+    username = (username or "").strip().lower()
+    with ENGINE.begin() as con:
+        row = con.execute(select(users).where(users.c.username == username)).mappings().first()
+        if not row or not bool(row["active"]) or not _verify_password(password or "", row["password_hash"]):
+            return None
+        con.execute(update(users).where(users.c.id == row["id"]).values(last_login=now_iso()))
+        out = dict(row)
+        out.pop("password_hash", None)
+    audit_event(username, "auth.login", "user", username, "")
+    return out
 
 
-def require_permission(permission: str) -> None:
-    role = st.session_state.user.get("role", "viewer")
-    if not has_permission(role, permission):
-        st.error("บัญชีนี้ไม่มีสิทธิ์ใช้งานส่วนนี้")
-        st.stop()
+def list_users_df() -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        stmt = select(
+            users.c.id, users.c.username, users.c.display_name, users.c.role,
+            users.c.active, users.c.created_at, users.c.last_login, users.c.must_change_password,
+        ).order_by(users.c.username.asc())
+        return pd.read_sql(stmt, con)
 
 
-st.set_page_config(page_title="ระบบนับการสอนแทน V4.2", page_icon="📚", layout="wide")
-try:
-    init_db()
-except Exception as exc:
-    st.error("ยังเชื่อมต่อ/ตั้งค่าฐานข้อมูลไม่สำเร็จ")
-    st.code(str(exc))
-    st.info("ถ้า Deploy บน Streamlit Community Cloud ให้ตรวจ DATABASE_URL และ BOOTSTRAP_ADMIN_PASSWORD ใน App settings → Secrets")
-    st.stop()
-st.markdown(
-    """
-    <style>
-      .block-container {padding-top: 1.25rem; padding-bottom: 2rem;}
-      div[data-testid="stMetric"] {border:1px solid #dfe7ef; border-radius:12px; padding:10px 14px;}
-      .online-badge {display:inline-block;padding:4px 10px;border-radius:999px;background:#e7f5ee;color:#146c43;font-size:.85rem;font-weight:600}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-for key, default in {
-    "user": None,
-    "batch_records": [], "batch_file_hashes": {}, "batch_warnings": {}, "batch_file_bytes": {},
-    "last_pdf": None, "timetable_preview": None, "timetable_preview_meta": None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-if not st.session_state.user:
-    login_screen()
-    st.stop()
-
-user = st.session_state.user
-username = str(user.get("username", ""))
-role = str(user.get("role", "viewer"))
-
-if bool(user.get("must_change_password")):
-    st.title("🔐 เปลี่ยนรหัสผ่านก่อนเริ่มใช้งาน")
-    st.warning("บัญชีนี้ใช้รหัสผ่านชั่วคราว กรุณาเปลี่ยนก่อนใช้งานระบบ")
-    with st.form("force_pw"):
-        old = st.text_input("รหัสผ่านปัจจุบัน", type="password")
-        new1 = st.text_input("รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)", type="password")
-        new2 = st.text_input("ยืนยันรหัสผ่านใหม่", type="password")
-        ok = st.form_submit_button("เปลี่ยนรหัสผ่าน", type="primary")
-    if ok:
-        if new1 != new2:
-            st.error("รหัสผ่านใหม่ไม่ตรงกัน")
-        else:
-            try:
-                change_own_password(username, old, new1)
-                fresh = authenticate_user(username, new1)
-                st.session_state.user = fresh
-                st.success("เปลี่ยนรหัสผ่านแล้ว")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-    st.stop()
-
-settings = get_settings()
-st.title(f"📚 {settings.get('app_title', 'ระบบนับและสรุปการสอนแทน')}")
-st.caption(f"เวอร์ชัน {APP_VERSION} | ฐานข้อมูล {database_kind()} | ไม่ใช้ Generative AI ในการอ่านเอกสาร")
-
-menu = ["แดชบอร์ด", "ช่วยจัดครูสอนแทน", "รายงาน / พิมพ์", "ข้อมูลทั้งหมด", "นำเข้า / ส่งออก", "บัญชีของฉัน"]
-if has_permission(role, "upload"):
-    menu.insert(0, "อัปโหลด Word/PDF")
-if has_permission(role, "manual"):
-    menu.insert(menu.index("ข้อมูลทั้งหมด"), "บันทึกด้วยมือ")
-if has_permission(role, "settings"):
-    menu.append("ตั้งค่า / ระบบ")
-if has_permission(role, "users"):
-    menu.append("ผู้ใช้งาน / Audit")
-
-with st.sidebar:
-    st.markdown("<span class='online-badge'>● FreeCloud V4.2</span>", unsafe_allow_html=True)
-    st.subheader(user.get("display_name") or username)
-    st.caption(f"{ROLE_LABELS.get(role, role)} · @{username}")
-    page = st.radio("เมนู", menu, label_visibility="collapsed")
-    st.divider()
-    if st.button("ออกจากระบบ", use_container_width=True):
-        st.session_state.user = None
-        st.rerun()
-    st.caption("Word / PDF / PDF สแกน OCR · Supabase PostgreSQL · Multi-user")
+def update_user(user_id: int, display_name: str, role: str, active: bool, changed_by: str) -> None:
+    if role not in ROLE_LABELS:
+        raise ValueError("สิทธิ์ผู้ใช้ไม่ถูกต้อง")
+    with ENGINE.begin() as con:
+        row = con.execute(select(users.c.username).where(users.c.id == int(user_id))).first()
+        if not row:
+            raise ValueError("ไม่พบผู้ใช้")
+        con.execute(update(users).where(users.c.id == int(user_id)).values(
+            display_name=display_name.strip(), role=role, active=bool(active),
+        ))
+    audit_event(changed_by, "user.update", "user", str(user_id), {"role": role, "active": bool(active), "display_name": display_name})
 
 
-if page == "อัปโหลด Word/PDF":
-    require_permission("upload")
-    st.subheader("📥 เพิ่มเอกสาร Word / PDF")
-    st.write("อัปโหลดได้หลายไฟล์ ระบบอ่านข้อมูลและให้ตรวจ Preview ก่อนบันทึกฐานข้อมูลกลาง")
-
-    ocr_status = tesseract_status()
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        uploaded_files = st.file_uploader(
-            "เลือกเอกสาร", type=["doc", "docx", "pdf"], accept_multiple_files=True,
-            help=".doc ใช้ LibreOffice / PDF สแกนใช้ Tesseract OCR ภาษาไทย",
-        )
-    with c2:
-        use_ocr = st.checkbox("OCR อัตโนมัติเมื่อ PDF อ่านตารางไม่ได้", value=True)
-        force_ocr = st.checkbox("บังคับ OCR PDF ทุกไฟล์", value=False)
-        if use_ocr and not ocr_status["available"]:
-            st.warning("เซิร์ฟเวอร์ยังไม่พบ Tesseract — PDF สแกนจะยังอ่านไม่ได้")
-        elif use_ocr and not ocr_status["thai"]:
-            st.warning("Tesseract ยังไม่มีภาษาไทย (tha)")
-
-    b1, b2 = st.columns(2)
-    read_btn = b1.button("1) อ่านไฟล์ทั้งหมด", type="primary", disabled=not uploaded_files)
-    clear_btn = b2.button("ล้างรายการที่อ่านแล้ว")
-    if clear_btn:
-        for k in ["batch_records", "batch_file_hashes", "batch_warnings", "batch_file_bytes"]:
-            st.session_state[k] = {} if k != "batch_records" else []
-        st.rerun()
-
-    if read_btn and uploaded_files:
-        all_records, file_hashes, warnings_map, file_bytes = [], {}, {}, {}
-        name_counts = {}
-        progress = st.progress(0, text="กำลังอ่านเอกสาร...")
-        for i, uploaded in enumerate(uploaded_files, start=1):
-            base_name = uploaded.name
-            name_counts[base_name] = name_counts.get(base_name, 0) + 1
-            display_name = base_name if name_counts[base_name] == 1 else f"{base_name} ({name_counts[base_name]})"
-            suffix = Path(base_name).suffix.lower()
-            raw_bytes = uploaded.getvalue()
-            file_bytes[display_name] = raw_bytes
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(raw_bytes)
-                tmp_path = tmp.name
-            try:
-                fh = file_sha256(tmp_path)
-                file_hashes[display_name] = fh
-                already = is_file_imported(fh)
-                warnings = []
-                if already:
-                    warnings.append(f"ไฟล์นี้เคยนำเข้าแล้ว: {already[0]} เมื่อ {already[1]} ({already[2]} รายการ)")
-                recs, parse_warnings, converted = parse_document(
-                    tmp_path, enable_ocr=use_ocr,
-                    force_ocr=(force_ocr and suffix == ".pdf"),
-                )
-                warnings.extend(parse_warnings)
-                if converted is not None:
-                    try:
-                        shutil.rmtree(converted.parent, ignore_errors=True)
-                    except Exception:
-                        pass
-                for r in recs:
-                    r["source_file"] = display_name
-                    all_records.append(normalize_record(r))
-                warnings_map[display_name] = warnings
-            except Exception as exc:
-                warnings_map[display_name] = [f"อ่านไฟล์ไม่สำเร็จ: {exc}"]
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-            progress.progress(i / len(uploaded_files), text=f"อ่านแล้ว {i}/{len(uploaded_files)} ไฟล์")
-        progress.empty()
-        st.session_state.batch_records = all_records
-        st.session_state.batch_file_hashes = file_hashes
-        st.session_state.batch_warnings = warnings_map
-        st.session_state.batch_file_bytes = file_bytes
-
-    if st.session_state.batch_warnings:
-        with st.expander("ผลการตรวจไฟล์ / คำเตือน", expanded=True):
-            for fname, warnings in st.session_state.batch_warnings.items():
-                if warnings:
-                    st.markdown(f"**{fname}**")
-                    for w in warnings:
-                        st.warning(w)
-
-    if st.session_state.batch_records:
-        st.markdown("### 2) ตรวจสอบข้อมูลก่อนนำเข้า")
-        preview = pd.DataFrame(st.session_state.batch_records)
-        show_cols = [
-            "source_file", "date_iso", "absent_teacher", "leave_type", "period", "subject",
-            "class_name", "substitute_teacher", "acknowledged", "note", "confidence",
-        ]
-        for c in show_cols:
-            if c not in preview.columns:
-                preview[c] = ""
-        edited = st.data_editor(
-            preview[show_cols], use_container_width=True, hide_index=True, num_rows="fixed",
-            disabled=["source_file", "confidence"],
-            column_config={
-                "source_file": "ไฟล์", "date_iso": "วันที่ (YYYY-MM-DD)", "absent_teacher": "ครูประจำวิชา/คนลา",
-                "leave_type": st.column_config.SelectboxColumn("ประเภทการลา", options=["ลากิจ", "ลาป่วย", "ไปราชการ", "ลาคลอด", "ไม่ระบุ"]),
-                "period": st.column_config.NumberColumn("คาบ", min_value=1, max_value=20, step=1),
-                "subject": "วิชา", "class_name": "ชั้น", "substitute_teacher": "ผู้สอนแทน",
-                "acknowledged": "รับทราบ", "note": "หมายเหตุ", "confidence": "ความมั่นใจ",
-            },
-        )
-        ocr_count = edited["confidence"].astype(str).str.contains("OCR", na=False).sum()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("รายการที่พบ", len(edited))
-        c2.metric("มาจาก OCR", int(ocr_count))
-        c3.metric("ไฟล์", edited["source_file"].nunique())
-        if ocr_count:
-            st.warning("รายการจาก OCR ควรตรวจชื่อครู วันที่ วิชา ชั้น และผู้สอนแทนก่อนยืนยัน")
-
-        if st.button("3) ยืนยันนำเข้าฐานข้อมูลกลาง", type="primary"):
-            normalized = [normalize_record(x) for x in edited.to_dict("records")]
-            total_added = total_skipped = 0
-            storage_errors = []
-            for fname, group in pd.DataFrame(normalized).groupby("source_file", dropna=False):
-                fname = str(fname)
-                fh = st.session_state.batch_file_hashes.get(fname, f"edited-{fname}")
-                recs = group.to_dict("records")
-                method_set = sorted(set(str(r.get("import_method", "")) for r in recs if r.get("import_method")))
-                method = ",".join(method_set) or "document"
-                warning_text = " | ".join(st.session_state.batch_warnings.get(fname, []))
-                storage_key = ""
-                raw = st.session_state.batch_file_bytes.get(fname)
-                if raw:
-                    try:
-                        storage_key = store_file(raw, fname, fh)
-                    except Exception as exc:
-                        storage_errors.append(f"{fname}: เก็บไฟล์ต้นฉบับไม่สำเร็จ ({exc}) แต่ข้อมูลตารางยังนำเข้าได้")
-                added, skipped = insert_records(
-                    recs, fh, fname, method, warning_text, storage_key=storage_key, username=username,
-                )
-                total_added += added
-                total_skipped += skipped
-            st.success(f"นำเข้าเรียบร้อย {total_added} รายการ | ข้ามรายการซ้ำ/ข้อมูลไม่ครบ {total_skipped} รายการ")
-            for msg in storage_errors:
-                st.warning(msg)
-            st.session_state.batch_records = []
-            st.session_state.batch_file_hashes = {}
-            st.session_state.batch_warnings = {}
-            st.session_state.batch_file_bytes = {}
+def reset_user_password(user_id: int, new_password: str, changed_by: str, must_change: bool = True) -> None:
+    with ENGINE.begin() as con:
+        row = con.execute(select(users.c.username).where(users.c.id == int(user_id))).first()
+        if not row:
+            raise ValueError("ไม่พบผู้ใช้")
+        con.execute(update(users).where(users.c.id == int(user_id)).values(
+            password_hash=_hash_password(new_password), must_change_password=bool(must_change),
+        ))
+    audit_event(changed_by, "user.password_reset", "user", str(user_id), "")
 
 
-elif page == "ช่วยจัดครูสอนแทน":
-    st.subheader("🧑‍🏫 ช่วยจัดครูสอนแทน")
-    st.caption("ตรวจครูที่ว่างจากตารางสอนจริง แล้วเรียงคำแนะนำโดยคำนึงถึงความเป็นธรรม ภาระสอน และประสบการณ์ในวิชา")
-
-    tab_help, tab_import, tab_unavailable, tab_view = st.tabs([
-        "ช่วยเลือกครู", "นำเข้าตารางสอน", "ครูไม่ว่าง/ติดภารกิจ", "ดูตารางสอน"
-    ])
-
-    with tab_help:
-        c1, c2, c3 = st.columns(3)
-        work_date = c1.date_input("วันที่ต้องจัดสอนแทน", value=today_th(), key="assist_date")
-        default_ay = thai_academic_year(work_date, settings.get("academic_year_start", "05-01"))
-        ay = c2.number_input("ปีการศึกษา (พ.ศ.)", min_value=2500, max_value=2700, value=int(default_ay), step=1, key="assist_ay")
-        term = c3.selectbox("ภาคเรียน", [1, 2], key="assist_term", format_func=lambda x: f"ภาคเรียนที่ {x}")
-
-        tt = timetable_df(int(ay), int(term))
-        if tt.empty:
-            st.info("ยังไม่มีตารางสอนสำหรับปีการศึกษา/ภาคเรียนนี้ กรุณาเปิดแท็บ 'นำเข้าตารางสอน' ก่อน")
-        else:
-            weekday = DAY_NAMES[work_date.weekday()]
-            day_tt = tt[tt["weekday"].astype(str) == weekday].copy()
-            teachers = sorted(x for x in tt["teacher"].dropna().astype(str).str.strip().unique() if x and "ลส.-" not in x and "สำรอง" not in x)
-            if work_date.weekday() >= 5:
-                st.warning("วันที่เลือกเป็นวันเสาร์/อาทิตย์ ตารางต้นฉบับมีเฉพาะวันจันทร์–ศุกร์")
-            absent = st.selectbox("ครูที่ไม่สามารถเข้าสอนได้", [""] + teachers, key="assist_absent")
-
-            selected_period = None
-            selected_subject = ""
-            selected_class = ""
-            if absent:
-                own = day_tt[day_tt["teacher"].astype(str).str.strip() == absent].copy()
-                if not own.empty:
-                    own = own.sort_values(["period", "class_name", "subject"])
-                    own["label"] = own.apply(lambda r: f"คาบ {int(r['period'])} | {r['subject']} | {r['class_name']}", axis=1)
-                    labels = own["label"].tolist()
-                    chosen_label = st.selectbox("คาบของครูที่ต้องจัดสอนแทน", labels, key="assist_assignment")
-                    chosen = own[own["label"] == chosen_label].iloc[0]
-                    selected_period = int(chosen["period"])
-                    selected_subject = str(chosen["subject"])
-                    selected_class = str(chosen["class_name"])
-                else:
-                    st.warning(f"ไม่พบคาบสอนของ {absent} ในวัน{weekday} — สามารถระบุคาบเองได้")
-                    cc1, cc2, cc3 = st.columns(3)
-                    selected_period = int(cc1.number_input("คาบ", min_value=1, max_value=8, value=1, step=1, key="assist_period_manual"))
-                    selected_subject = cc2.text_input("วิชา", key="assist_subject_manual")
-                    selected_class = cc3.text_input("ชั้น", key="assist_class_manual")
-
-            if absent and selected_period:
-                st.markdown(f"**รายการ:** วัน{weekday} · คาบ {selected_period} · {selected_subject or '-'} · {selected_class or '-'}")
-                ranked = recommend_substitutes(
-                    work_date.isoformat(), int(ay), int(term), int(selected_period), absent, selected_subject, True
-                )
-                if ranked.empty:
-                    st.warning("ยังไม่พบข้อมูลครูสำหรับจัดอันดับ")
-                else:
-                    eligible = ranked[ranked["eligible"] == True].copy()
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("ครูว่าง", len(eligible))
-                    c2.metric("ครูมีสอน/ไม่ว่าง", len(ranked) - len(eligible))
-                    c3.metric("คำแนะนำอันดับ 1", eligible.iloc[0]["teacher"] if not eligible.empty else "ไม่มี")
-
-                    show = ranked.rename(columns={
-                        "teacher": "ครู", "status": "สถานะ", "substitute_count": "สอนแทนสะสม",
-                        "daily_load": "คาบสอนวันนี้", "subject_match": "ความถนัด",
-                    })
-                    st.dataframe(show[["ครู", "สถานะ", "สอนแทนสะสม", "คาบสอนวันนี้", "ความถนัด"]], use_container_width=True, hide_index=True)
-
-                    if not eligible.empty:
-                        st.caption("ระบบเรียงจากจำนวนสอนแทนสะสมน้อยก่อน จากนั้นดูภาระสอนในวันนั้น และให้โบนัสเล็กน้อยกับครูที่เคยสอนวิชาเดียวกัน")
-                        pick = st.selectbox("เลือกครูผู้สอนแทน", eligible["teacher"].tolist(), key="assist_pick")
-                        leave = st.selectbox("ประเภทการลา/เหตุ", ["ลากิจ", "ลาป่วย", "ไปราชการ", "ลาคลอด", "ไม่ระบุ"], key="assist_leave")
-                        note = st.text_input("หมายเหตุ", value="ทำใบงาน", key="assist_note")
-                        if has_permission(role, "manual"):
-                            if st.button("ยืนยันและบันทึกการสอนแทน", type="primary", key="assist_save"):
-                                r = normalize_record({
-                                    "date_iso": work_date.isoformat(), "absent_teacher": absent, "leave_type": leave,
-                                    "period": selected_period, "subject": selected_subject, "class_name": selected_class,
-                                    "substitute_teacher": pick, "acknowledged": "", "note": note,
-                                    "source_file": "ระบบช่วยจัดครูสอนแทน", "confidence": "ตารางสอน", "import_method": "scheduler",
-                                })
-                                source_hash = f"scheduler-{work_date.isoformat()}-{absent}-{selected_period}-{pick}"
-                                added, skipped = insert_records([r], source_hash, "ระบบช่วยจัดครูสอนแทน", "scheduler", username=username)
-                                if added:
-                                    st.success("บันทึกการสอนแทนเรียบร้อย")
-                                    st.rerun()
-                                else:
-                                    st.warning("รายการนี้อาจถูกบันทึกไว้แล้ว หรือข้อมูลสำคัญไม่ครบ")
-                        else:
-                            st.info("บัญชีนี้ดูคำแนะนำได้ แต่ไม่มีสิทธิ์บันทึกรายการ")
-
-    with tab_import:
-        if not has_permission(role, "timetable"):
-            st.info("เฉพาะผู้ดูแลระบบ/ฝ่ายวิชาการเท่านั้นที่นำเข้าตารางสอนได้")
-        else:
-            st.write("รองรับไฟล์ต้นฉบับรูปแบบ `.xlsm` นี้โดยตรง ระบบอ่านค่าที่บันทึกไว้จากชีต `ข้อมูลครูผู้สอน` และ `ลงตาราง` โดยไม่แกะรหัส VBA")
-            c1, c2 = st.columns(2)
-            imp_ay = c1.number_input("ปีการศึกษา", min_value=2500, max_value=2700, value=int(today_th().year + 543), step=1, key="tt_imp_ay")
-            imp_term = c2.selectbox("ภาคเรียน", [1, 2], key="tt_imp_term", format_func=lambda x: f"ภาคเรียนที่ {x}")
-            tt_file = st.file_uploader("เลือกไฟล์ตารางสอน", type=["xlsm", "xlsx", "xls"], key="tt_file")
-            if tt_file is not None and st.button("1) อ่านและตรวจสอบตารางสอน", type="primary", key="tt_read"):
-                raw = tt_file.getvalue()
-                suffix = Path(tt_file.name).suffix.lower()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(raw)
-                    tmp_path = tmp.name
-                try:
-                    parsed = parse_timetable_file(tmp_path)
-                    fh = file_sha256(tmp_path)
-                    st.session_state.timetable_preview = parsed
-                    st.session_state.timetable_preview_meta = {
-                        "file_name": tt_file.name, "file_hash": fh, "academic_year": int(imp_ay), "term": int(imp_term)
-                    }
-                except Exception as exc:
-                    st.session_state.timetable_preview = None
-                    st.session_state.timetable_preview_meta = None
-                    st.error(f"อ่านตารางสอนไม่สำเร็จ: {exc}")
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-
-            preview = st.session_state.get("timetable_preview")
-            meta = st.session_state.get("timetable_preview_meta")
-            if preview and meta:
-                stats = preview.get("stats", {})
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("ครู", stats.get("teachers", 0))
-                c2.metric("รายการครู-คาบ", stats.get("entries", 0))
-                c3.metric("วัน", stats.get("days", 0))
-                c4.metric("ชั้น", stats.get("classes", 0))
-                pdf = pd.DataFrame(preview.get("entries", []))
-                if not pdf.empty:
-                    display = pdf.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู", "teacher_slot":"ครูคนที่"})
-                    st.dataframe(display[["วัน", "คาบ", "ชั้น", "วิชา", "ครู", "ครูคนที่"]].head(300), use_container_width=True, hide_index=True)
-                warnings = preview.get("warnings", [])
-                if warnings:
-                    with st.expander(f"คำเตือน {len(warnings)} รายการ"):
-                        for w in warnings[:100]:
-                            st.warning(w)
-                st.warning(f"เมื่อยืนยัน ระบบจะแทนที่ตารางสอนเดิมของปีการศึกษา {meta['academic_year']} ภาคเรียนที่ {meta['term']} เท่านั้น")
-                if st.button("2) ยืนยันนำเข้าตารางสอน", type="primary", key="tt_confirm"):
-                    n = import_timetable(
-                        preview.get("entries", []), meta["academic_year"], meta["term"], meta["file_hash"], meta["file_name"],
-                        teacher_count=stats.get("teachers", 0), warning_text=" | ".join(warnings), username=username,
-                    )
-                    st.success(f"นำเข้าตารางสอนแล้ว {n} รายการ")
-                    st.session_state.timetable_preview = None
-                    st.session_state.timetable_preview_meta = None
-                    st.rerun()
-
-            hist = timetable_imports_df()
-            if not hist.empty:
-                st.markdown("#### ประวัตินำเข้าตารางสอน")
-                st.dataframe(hist[[c for c in ["file_name", "academic_year", "term", "row_count", "teacher_count", "imported_at", "uploaded_by"] if c in hist.columns]], use_container_width=True, hide_index=True)
-
-    with tab_unavailable:
-        tta = timetable_df()
-        teacher_choices = sorted(x for x in tta["teacher"].dropna().astype(str).str.strip().unique() if x and "ลส.-" not in x and "สำรอง" not in x) if not tta.empty else []
-        d = st.date_input("วันที่", value=today_th(), key="ua_date")
-        if has_permission(role, "timetable"):
-            with st.form("ua_add"):
-                c1, c2, c3 = st.columns(3)
-                teacher = c1.selectbox("ครู", teacher_choices, key="ua_teacher") if teacher_choices else c1.text_input("ครู")
-                period = c2.selectbox("ช่วงเวลา", [0,1,2,3,4,5,6,7,8], format_func=lambda x: "ทั้งวัน" if x == 0 else f"คาบ {x}")
-                reason = c3.text_input("เหตุผล/ภารกิจ")
-                add_ok = st.form_submit_button("เพิ่มรายการไม่ว่าง")
-            if add_ok:
-                add_unavailability(d.isoformat(), teacher, int(period), reason, username=username)
-                st.success("บันทึกแล้ว")
-                st.rerun()
-        ua = unavailability_df(d.isoformat())
-        if ua.empty:
-            st.caption("ยังไม่มีรายการครูไม่ว่าง/ติดภารกิจในวันนี้")
-        else:
-            show = ua.copy()
-            show["ช่วงเวลา"] = show["period"].apply(lambda x: "ทั้งวัน" if int(x or 0) == 0 else f"คาบ {int(x)}")
-            st.dataframe(show[["id", "teacher", "ช่วงเวลา", "reason", "created_by"]], use_container_width=True, hide_index=True)
-            if has_permission(role, "timetable"):
-                ids = st.multiselect("เลือก ID ที่ต้องการลบ", show["id"].astype(int).tolist(), key="ua_del_ids")
-                if st.button("ลบรายการที่เลือก", disabled=not ids, key="ua_del"):
-                    delete_unavailability(ids, username=username)
-                    st.rerun()
-
-    with tab_view:
-        all_tt = timetable_df()
-        if all_tt.empty:
-            st.info("ยังไม่มีตารางสอนในฐานข้อมูล")
-        else:
-            years = sorted(all_tt["academic_year"].astype(int).unique(), reverse=True)
-            c1, c2, c3 = st.columns(3)
-            vy = c1.selectbox("ปีการศึกษา", years, key="view_tt_ay")
-            terms = sorted(all_tt.loc[all_tt["academic_year"].astype(int) == int(vy), "term"].astype(int).unique())
-            vt = c2.selectbox("ภาคเรียน", terms, key="view_tt_term")
-            vday = c3.selectbox("วัน", ["ทั้งหมด"] + DAY_NAMES[:5], key="view_tt_day")
-            view = timetable_df(int(vy), int(vt))
-            if vday != "ทั้งหมด":
-                view = view[view["weekday"] == vday]
-            show = view.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู"})
-            st.dataframe(show[["วัน", "คาบ", "ชั้น", "วิชา", "ครู"]], use_container_width=True, hide_index=True)
+def change_own_password(username: str, old_password: str, new_password: str) -> None:
+    username = username.strip().lower()
+    with ENGINE.begin() as con:
+        row = con.execute(select(users).where(users.c.username == username)).mappings().first()
+        if not row or not _verify_password(old_password, row["password_hash"]):
+            raise ValueError("รหัสผ่านเดิมไม่ถูกต้อง")
+        con.execute(update(users).where(users.c.id == row["id"]).values(
+            password_hash=_hash_password(new_password), must_change_password=False,
+        ))
+    audit_event(username, "auth.password_change", "user", username, "")
 
 
-elif page == "แดชบอร์ด":
-    st.subheader("📊 แดชบอร์ดสรุปการสอนแทน")
-    df = df_all()
-    settings = get_settings()
-    if df.empty:
-        st.info("ยังไม่มีข้อมูล")
-    else:
-        filtered, meta = report_filter(df, settings)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("คาบสอนแทนรวม", len(filtered))
-        c2.metric("ผู้สอนแทน", filtered["substitute_teacher"].nunique() if not filtered.empty else 0)
-        c3.metric("คนลา/ครูประจำวิชา", filtered["absent_teacher"].nunique() if not filtered.empty else 0)
-        c4.metric("วันที่มีสอนแทน", filtered["date_iso"].nunique() if not filtered.empty else 0)
-        st.caption(f"ช่วงรายงาน: {meta['start'].strftime('%d/%m/%Y')} – {meta['end'].strftime('%d/%m/%Y')}")
+def make_portable_backup_bytes() -> bytes:
+    rec_df = df_all()
+    file_df = imported_files_df()
+    user_df = list_users_df()
+    tt_df = timetable_df()
+    tt_imp_df = timetable_imports_df()
+    ua_df = unavailability_df()
+    payload = {
+        "version": 4,
+        "created_at": now_iso(),
+        "records": rec_df.where(pd.notna(rec_df), None).to_dict("records"),
+        "imported_files": file_df.where(pd.notna(file_df), None).to_dict("records"),
+        "timetable_entries": tt_df.where(pd.notna(tt_df), None).to_dict("records"),
+        "timetable_imports": tt_imp_df.where(pd.notna(tt_imp_df), None).to_dict("records"),
+        "teacher_unavailability": ua_df.where(pd.notna(ua_df), None).to_dict("records"),
+        "settings": get_settings(),
+        "users_public": user_df.where(pd.notna(user_df), None).to_dict("records"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, default=str, indent=2).encode("utf-8")
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("backup.json", raw)
+        z.writestr("README.txt", "V4 portable backup: records, imported_files, settings, public user metadata. Password hashes are intentionally excluded.\n")
+    return out.getvalue()
 
-        t1, t2, t3, t4 = st.tabs(["ผู้สอนแทน", "คนลา", "วิชา", "แนวโน้มรายเดือน"])
-        with t1:
-            by_teacher = filtered.groupby("substitute_teacher").size().reset_index(name="จำนวนคาบ").sort_values("จำนวนคาบ", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_teacher, use_container_width=True, hide_index=True)
-            if not by_teacher.empty:
-                st.bar_chart(by_teacher.set_index("substitute_teacher"))
-        with t2:
-            by_absent = filtered.groupby("absent_teacher").size().reset_index(name="จำนวนคาบที่มีผู้สอนแทน").sort_values("จำนวนคาบที่มีผู้สอนแทน", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_absent, use_container_width=True, hide_index=True)
-            if not by_absent.empty:
-                st.bar_chart(by_absent.set_index("absent_teacher"))
-        with t3:
-            by_subject = filtered.groupby("subject").size().reset_index(name="จำนวนคาบ").sort_values("จำนวนคาบ", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_subject, use_container_width=True, hide_index=True)
-        with t4:
-            if filtered.empty:
-                st.info("ไม่มีข้อมูลในช่วงที่เลือก")
+
+def restore_portable_backup_bytes(data: bytes, username: str) -> dict:
+    with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+        payload = json.loads(z.read("backup.json").decode("utf-8"))
+    if int(payload.get("version", 0)) != 4:
+        raise ValueError("ไฟล์สำรองไม่ใช่ V4 ที่รองรับ")
+    rec_rows = payload.get("records", [])
+    file_rows = payload.get("imported_files", [])
+    tt_rows = payload.get("timetable_entries", [])
+    tt_import_rows = payload.get("timetable_imports", [])
+    ua_rows = payload.get("teacher_unavailability", [])
+    settings = payload.get("settings", {})
+    with ENGINE.begin() as con:
+        con.execute(delete(records))
+        con.execute(delete(imported_files))
+        con.execute(delete(timetable_entries))
+        con.execute(delete(timetable_imports))
+        con.execute(delete(teacher_unavailability))
+        for r in rec_rows:
+            vals = {c.name: r.get(c.name) for c in records.columns if c.name != "id"}
+            if not vals.get("record_hash"):
+                vals["record_hash"] = record_fingerprint(vals)
+            if con.execute(select(records.c.id).where(records.c.record_hash == vals["record_hash"])).first() is None:
+                con.execute(insert(records).values(**vals))
+        for f in file_rows:
+            vals = {c.name: f.get(c.name) for c in imported_files.columns}
+            fh = vals.get("file_hash")
+            if fh and con.execute(select(imported_files.c.file_hash).where(imported_files.c.file_hash == fh)).first() is None:
+                con.execute(insert(imported_files).values(**vals))
+        for row in tt_rows:
+            vals = {c.name: row.get(c.name) for c in timetable_entries.columns if c.name != "id"}
+            if vals.get("academic_year") and vals.get("term") and vals.get("teacher"):
+                con.execute(insert(timetable_entries).values(**vals))
+        for row in tt_import_rows:
+            vals = {c.name: row.get(c.name) for c in timetable_imports.columns}
+            if vals.get("file_hash"):
+                con.execute(insert(timetable_imports).values(**vals))
+        for row in ua_rows:
+            vals = {c.name: row.get(c.name) for c in teacher_unavailability.columns if c.name != "id"}
+            if vals.get("date_iso") and vals.get("teacher"):
+                con.execute(insert(teacher_unavailability).values(**vals))
+        for k, v in settings.items():
+            exists = con.execute(select(settings_table.c.key).where(settings_table.c.key == str(k))).first()
+            if exists:
+                con.execute(update(settings_table).where(settings_table.c.key == str(k)).values(value=str(v)))
             else:
-                trend = filtered.copy()
-                trend["เดือน"] = pd.to_datetime(trend["date_iso"]).dt.to_period("M").astype(str)
-                trend = trend.groupby("เดือน").size().reset_index(name="จำนวนคาบ")
-                st.line_chart(trend.set_index("เดือน"))
-                st.dataframe(trend, use_container_width=True, hide_index=True)
-
-        if has_permission(role, "export"):
-            st.download_button(
-                "ดาวน์โหลด Excel ตามตัวกรองนี้", data=make_excel(filtered),
-                file_name=f"สรุปการสอนแทน_ปีการศึกษา_{meta['academic_year']}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                con.execute(insert(settings_table).values(key=str(k), value=str(v)))
+    audit_event(username, "backup.restore", "database", "portable", {"records": len(rec_rows), "files": len(file_rows)})
+    return {"records": len(rec_rows), "files": len(file_rows), "timetable": len(tt_rows), "unavailability": len(ua_rows)}
 
 
-elif page == "รายงาน / พิมพ์":
-    st.subheader("🖨️ รายงานรายวันและแบบบันทึกการสอนแทน")
-    df = df_all()
-    settings = get_settings()
-    if df.empty:
-        st.info("ยังไม่มีข้อมูล")
-    else:
-        valid_dates = sorted([date.fromisoformat(x) for x in df["date_iso"].dropna().astype(str).unique() if x], reverse=True)
-        selected_date = st.selectbox("วันที่", valid_dates, format_func=thai_date_long)
-        daydf = df[df["date_iso"] == selected_date.isoformat()].copy()
-        absent_list = sorted(x for x in daydf["absent_teacher"].dropna().astype(str).unique() if x.strip())
-        if not absent_list:
-            st.info("ไม่พบชื่อครูในวันที่เลือก")
+def read_v3_sqlite_bytes(data: bytes) -> dict:
+    if not data.startswith(b"SQLite format 3\x00"):
+        raise ValueError("ไฟล์นี้ไม่ใช่ฐานข้อมูล SQLite V3")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        con = sqlite3.connect(tmp_path)
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "records" not in tables:
+            raise ValueError("ไม่พบตาราง records ของ V3")
+        recs = pd.read_sql_query("SELECT * FROM records", con).to_dict("records")
+        files = pd.read_sql_query("SELECT * FROM imported_files", con).to_dict("records") if "imported_files" in tables else []
+        settings = dict(con.execute("SELECT key,value FROM settings").fetchall()) if "settings" in tables else {}
+        con.close()
+        return {"records": recs, "imported_files": files, "settings": settings}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def migrate_v3_payload(payload: dict, username: str) -> dict:
+    added = skipped = 0
+    for r in payload.get("records", []):
+        r = dict(r)
+        source_hash = str(r.get("source_hash") or "v3-migration")
+        source_name = str(r.get("source_file") or "V3 database")
+        a, s = insert_records([r], source_hash, source_name, "v3-migration", username=username)
+        added += a
+        skipped += s
+    if payload.get("settings"):
+        set_settings(payload["settings"], username=username)
+    audit_event(username, "migration.v3", "database", "v3", {"added": added, "skipped": skipped})
+    return {"added": added, "skipped": skipped}
+
+
+def thai_academic_year(d: date, start_mmdd: str = "05-01") -> int:
+    try:
+        sm, sd = [int(x) for x in start_mmdd.split("-")]
+    except Exception:
+        sm, sd = 5, 1
+    start = date(d.year, sm, sd)
+    return d.year + 543 if d >= start else d.year + 542
+
+
+def academic_year_bounds(academic_year_th: int, settings: dict[str, str]) -> tuple[date, date]:
+    gy = int(academic_year_th) - 543
+    sm, sd = [int(x) for x in settings.get("academic_year_start", "05-01").split("-")]
+    em, ed = [int(x) for x in settings.get("term2_end", "04-30").split("-")]
+    start = date(gy, sm, sd)
+    end_year = gy + 1 if (em, ed) < (sm, sd) else gy
+    return start, date(end_year, em, ed)
+
+
+def term_bounds(academic_year_th: int, term: int, settings: dict[str, str]) -> tuple[date, date]:
+    gy = int(academic_year_th) - 543
+    if term == 1:
+        sm, sd = [int(x) for x in settings.get("academic_year_start", "05-01").split("-")]
+        em, ed = [int(x) for x in settings.get("term1_end", "10-31").split("-")]
+        start = date(gy, sm, sd)
+        end_year = gy + 1 if (em, ed) < (sm, sd) else gy
+        return start, date(end_year, em, ed)
+    sm, sd = [int(x) for x in settings.get("term2_start", "11-01").split("-")]
+    em, ed = [int(x) for x in settings.get("term2_end", "04-30").split("-")]
+    start = date(gy, sm, sd)
+    end_year = gy + 1 if (em, ed) < (sm, sd) else gy
+    return start, date(end_year, em, ed)
+
+
+# ---------------- Timetable / substitute-assist ----------------
+def timetable_df(academic_year: int | None = None, term: int | None = None) -> pd.DataFrame:
+    stmt = select(timetable_entries)
+    if academic_year is not None:
+        stmt = stmt.where(timetable_entries.c.academic_year == int(academic_year))
+    if term is not None:
+        stmt = stmt.where(timetable_entries.c.term == int(term))
+    stmt = stmt.order_by(
+        timetable_entries.c.academic_year.desc(), timetable_entries.c.term.asc(),
+        timetable_entries.c.weekday.asc(), timetable_entries.c.period.asc(),
+        timetable_entries.c.class_name.asc(), timetable_entries.c.teacher.asc(),
+    )
+    with ENGINE.connect() as con:
+        return pd.read_sql(stmt, con)
+
+
+def timetable_imports_df() -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        return pd.read_sql(select(timetable_imports).order_by(timetable_imports.c.imported_at.desc()), con)
+
+
+def import_timetable(
+    entries: list[dict], academic_year: int, term: int, source_hash: str, source_name: str,
+    teacher_count: int = 0, warning_text: str = "", username: str = "system",
+) -> int:
+    academic_year = int(academic_year)
+    term = int(term)
+    if term not in (1, 2):
+        raise ValueError("ภาคเรียนต้องเป็น 1 หรือ 2")
+    clean_rows = []
+    seen = set()
+    for e in entries:
+        try:
+            period = int(e.get("period") or 0)
+        except Exception:
+            period = 0
+        weekday = str(e.get("weekday") or "").strip()
+        teacher = str(e.get("teacher") or "").replace("\xa0", " ").strip()
+        subject = str(e.get("subject") or "").strip()
+        cls = str(e.get("class_name") or "").strip()
+        if not weekday or period <= 0 or not teacher:
+            continue
+        key = (weekday, period, cls, subject, teacher)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_rows.append(dict(
+            academic_year=academic_year, term=term, weekday=weekday, period=period,
+            class_name=cls, subject=subject, teacher=teacher,
+            teacher_slot=int(e.get("teacher_slot") or 1), source_hash=source_hash, imported_at=now_iso(),
+        ))
+    if not clean_rows:
+        raise ValueError("ไม่พบรายการตารางสอนที่บันทึกได้")
+
+    with ENGINE.begin() as con:
+        con.execute(delete(timetable_entries).where(
+            (timetable_entries.c.academic_year == academic_year) &
+            (timetable_entries.c.term == term)
+        ))
+        con.execute(insert(timetable_entries), clean_rows)
+        vals = dict(
+            file_name=source_name, academic_year=academic_year, term=term, imported_at=now_iso(),
+            row_count=len(clean_rows), teacher_count=int(teacher_count or 0),
+            warning_text=warning_text, uploaded_by=username or "system",
+        )
+        exists = con.execute(select(timetable_imports.c.file_hash).where(timetable_imports.c.file_hash == source_hash)).first()
+        if exists:
+            con.execute(update(timetable_imports).where(timetable_imports.c.file_hash == source_hash).values(**vals))
         else:
-            absent = st.selectbox("ครูประจำวิชา/คนลา", absent_list)
-            report_df = daydf[daydf["absent_teacher"] == absent].sort_values("period")
-            leave_type = report_df["leave_type"].iloc[0] if not report_df.empty else "ไม่ระบุ"
-            c1, c2, c3 = st.columns(3)
-            c1.metric("จำนวนคาบ", len(report_df))
-            c2.metric("ประเภท", leave_type)
-            c3.metric("ผู้สอนแทน", report_df["substitute_teacher"].nunique())
-            st.dataframe(
-                report_df[["period", "subject", "class_name", "substitute_teacher", "acknowledged", "note"]],
-                use_container_width=True, hide_index=True,
-            )
-            docx_bytes = make_substitution_docx(report_df, selected_date, absent, settings)
-            fname_base = f"บันทึกการสอนแทน_{selected_date.isoformat()}_{absent}".replace("/", "-")
-            c1, c2 = st.columns(2)
-            c1.download_button(
-                "ดาวน์โหลด Word พร้อมพิมพ์", data=docx_bytes, file_name=f"{fname_base}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary",
-            )
-            if c2.button("สร้าง PDF พร้อมพิมพ์"):
-                try:
-                    st.session_state.last_pdf = docx_bytes_to_pdf(docx_bytes)
-                    st.success("สร้าง PDF แล้ว")
-                except Exception as exc:
-                    st.session_state.last_pdf = None
-                    st.warning(str(exc))
-            if st.session_state.last_pdf:
-                st.download_button("ดาวน์โหลด PDF", data=st.session_state.last_pdf, file_name=f"{fname_base}.pdf", mime="application/pdf")
+            con.execute(insert(timetable_imports).values(file_hash=source_hash, **vals))
+    audit_event(username, "timetable.import", "timetable", f"{academic_year}-{term}", {
+        "file": source_name, "rows": len(clean_rows), "teachers": int(teacher_count or 0),
+    })
+    return len(clean_rows)
 
 
-elif page == "บันทึกด้วยมือ":
-    require_permission("manual")
-    st.subheader("✍️ เพิ่มรายการด้วยมือ")
-    with st.form("manual"):
-        c1, c2, c3 = st.columns(3)
-        d = c1.date_input("วันที่", value=today_th())
-        absent = c2.text_input("ครูประจำวิชา/คนลา")
-        leave = c3.selectbox("ประเภทการลา", ["ลากิจ", "ลาป่วย", "ไปราชการ", "ลาคลอด", "ไม่ระบุ"])
-        c4, c5, c6 = st.columns(3)
-        period = c4.number_input("คาบ", min_value=1, max_value=20, step=1)
-        subject = c5.text_input("วิชา")
-        cls = c6.text_input("ชั้น")
-        c7, c8 = st.columns(2)
-        sub = c7.text_input("ผู้สอนแทน")
-        note = c8.text_input("หมายเหตุ", value="ทำใบงาน")
-        ok = st.form_submit_button("บันทึก", type="primary")
-    if ok:
-        r = normalize_record({
-            "date_iso": d.isoformat(), "absent_teacher": absent, "leave_type": leave,
-            "period": period, "subject": subject, "class_name": cls, "substitute_teacher": sub,
-            "acknowledged": "", "note": note, "source_file": "กรอกด้วยมือ", "confidence": "กรอกเอง", "import_method": "manual",
+def unavailability_df(date_iso: str | None = None) -> pd.DataFrame:
+    stmt = select(teacher_unavailability)
+    if date_iso:
+        stmt = stmt.where(teacher_unavailability.c.date_iso == str(date_iso)[:10])
+    stmt = stmt.order_by(teacher_unavailability.c.date_iso.desc(), teacher_unavailability.c.period.asc(), teacher_unavailability.c.teacher.asc())
+    with ENGINE.connect() as con:
+        return pd.read_sql(stmt, con)
+
+
+def add_unavailability(date_iso: str, teacher: str, period: int = 0, reason: str = "", username: str = "system") -> int:
+    teacher = str(teacher or "").strip()
+    if not teacher:
+        raise ValueError("กรุณาระบุชื่อครู")
+    vals = dict(date_iso=str(date_iso)[:10], teacher=teacher, period=int(period or 0), reason=str(reason or "").strip(), created_by=username, created_at=now_iso())
+    with ENGINE.begin() as con:
+        result = con.execute(insert(teacher_unavailability).values(**vals))
+        rid = int(result.inserted_primary_key[0])
+    audit_event(username, "teacher.unavailable.add", "teacher_unavailability", str(rid), vals)
+    return rid
+
+
+def delete_unavailability(ids: Iterable[int], username: str = "system") -> int:
+    ids = [int(x) for x in ids]
+    if not ids:
+        return 0
+    with ENGINE.begin() as con:
+        result = con.execute(delete(teacher_unavailability).where(teacher_unavailability.c.id.in_(ids)))
+        n = int(result.rowcount or 0)
+    audit_event(username, "teacher.unavailable.delete", "teacher_unavailability", ",".join(map(str, ids)), {"count": n})
+    return n
+
+
+def recommend_substitutes(
+    date_iso: str, academic_year: int, term: int, period: int, absent_teacher: str, subject: str = "",
+    exclude_group_teachers: bool = True,
+) -> pd.DataFrame:
+    d = date.fromisoformat(str(date_iso)[:10])
+    day_names = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+    weekday = day_names[d.weekday()]
+    period = int(period)
+    tt = timetable_df(int(academic_year), int(term))
+    if tt.empty:
+        return pd.DataFrame()
+    day = tt[tt["weekday"].astype(str) == weekday].copy()
+    all_teachers = sorted(x for x in tt["teacher"].dropna().astype(str).str.strip().unique() if x)
+    busy = set(day.loc[day["period"].astype(int) == period, "teacher"].astype(str).str.strip())
+
+    rec = df_all()
+    same_date = rec[rec["date_iso"].astype(str) == str(date_iso)[:10]].copy() if not rec.empty else rec
+    already_sub = set()
+    if not same_date.empty:
+        already_sub = set(same_date.loc[same_date["period"].fillna(0).astype(int) == period, "substitute_teacher"].astype(str).str.strip())
+    hist_counts = rec["substitute_teacher"].astype(str).str.strip().value_counts().to_dict() if not rec.empty else {}
+
+    ua = unavailability_df(str(date_iso)[:10])
+    unavailable = set()
+    if not ua.empty:
+        u = ua[(ua["period"].fillna(0).astype(int).isin([0, period]))]
+        unavailable = set(u["teacher"].astype(str).str.strip())
+
+    subject = str(subject or "").strip()
+    rows = []
+    for teacher in all_teachers:
+        if teacher == str(absent_teacher or "").strip():
+            continue
+        if exclude_group_teachers and ("ลส.-" in teacher or "สำรอง" in teacher):
+            continue
+        reasons = []
+        eligible = True
+        if teacher in busy:
+            eligible = False
+            reasons.append("มีสอนคาบนี้")
+        if teacher in already_sub:
+            eligible = False
+            reasons.append("ถูกจัดสอนแทนคาบนี้แล้ว")
+        if teacher in unavailable:
+            eligible = False
+            reasons.append("ไม่ว่าง/ติดภารกิจ")
+        daily_load = int((day["teacher"].astype(str).str.strip() == teacher).sum())
+        substitute_count = int(hist_counts.get(teacher, 0))
+        subject_match = False
+        if subject:
+            subject_match = bool(((tt["teacher"].astype(str).str.strip() == teacher) & (tt["subject"].astype(str).str.strip() == subject)).any())
+        score = substitute_count * 10 + daily_load * 2 + (0 if subject_match else 4)
+        if not eligible:
+            score += 10000
+        rows.append({
+            "teacher": teacher, "eligible": eligible, "status": "ว่าง" if eligible else " / ".join(reasons),
+            "substitute_count": substitute_count, "daily_load": daily_load,
+            "subject_match": "ตรงวิชา" if subject_match else "", "score": score,
         })
-        source_hash = f"manual-{d.isoformat()}-{absent}-{period}"
-        added, skipped = insert_records([r], source_hash, "กรอกด้วยมือ", "manual", username=username)
-        if added:
-            st.success("บันทึกแล้ว")
-        else:
-            st.warning("รายการซ้ำหรือข้อมูลสำคัญไม่ครบ")
-
-
-elif page == "ข้อมูลทั้งหมด":
-    st.subheader("🗂️ ข้อมูลทั้งหมด")
-    df = df_all()
-    q = st.text_input("ค้นหา ชื่อครู / วิชา / ชั้น / ชื่อไฟล์")
-    if q and not df.empty:
-        mask = df.astype(str).apply(lambda col: col.str.contains(q, case=False, na=False)).any(axis=1)
-        df = df[mask]
-    st.write(f"แสดง {len(df)} รายการ")
-    display_cols = [
-        "id", "date_iso", "absent_teacher", "leave_type", "period", "subject", "class_name",
-        "substitute_teacher", "note", "source_file", "confidence", "created_by", "imported_at",
-    ]
-    st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True, hide_index=True)
-    if not df.empty and has_permission(role, "delete"):
-        with st.expander("ลบรายการที่บันทึกผิด"):
-            ids = st.multiselect("เลือก ID ที่ต้องการลบ", df["id"].astype(int).tolist())
-            confirm = st.checkbox("ยืนยันว่าต้องการลบรายการที่เลือก")
-            if st.button("ลบรายการ", disabled=not (ids and confirm)):
-                n = delete_records(ids, username=username)
-                st.success(f"ลบแล้ว {n} รายการ")
-                st.rerun()
-
-
-elif page == "นำเข้า / ส่งออก":
-    st.subheader("🔄 นำเข้า / ส่งออก / สำรองข้อมูล")
-    tabs = ["ส่งออก", "ประวัติไฟล์"]
-    if has_permission(role, "upload"):
-        tabs.insert(0, "นำเข้า Excel เดิม")
-    if has_permission(role, "restore"):
-        tabs.extend(["ย้ายจาก V3", "สำรอง/กู้คืน V4"])
-    tab_objs = st.tabs(tabs)
-    tab_map = dict(zip(tabs, tab_objs))
-
-    if "นำเข้า Excel เดิม" in tab_map:
-        with tab_map["นำเข้า Excel เดิม"]:
-            old_xlsx = st.file_uploader("เลือกไฟล์ Excel ระบบเดิม", type=["xlsx"], key="old_xlsx")
-            if old_xlsx is not None:
-                try:
-                    raw = pd.read_excel(old_xlsx, sheet_name="บันทึกข้อมูล", engine="calamine")
-                    mapping = {
-                        "วันที่":"date_iso", "วัน":"day_name", "พ.ศ.":"thai_year", "ครูประจำวิชา/คนลา":"absent_teacher",
-                        "ประเภทการลา":"leave_type", "คาบ":"period", "วิชา":"subject", "ชั้น":"class_name",
-                        "ผู้สอนแทน":"substitute_teacher", "รับทราบ":"acknowledged", "หมายเหตุ":"note", "ไฟล์อ้างอิง":"source_file",
-                    }
-                    found = [c for c in mapping if c in raw.columns]
-                    if not found:
-                        st.error("ไม่พบหัวคอลัมน์รูปแบบระบบเวอร์ชันก่อน")
-                    else:
-                        old = raw[found].rename(columns=mapping).copy()
-                        if "date_iso" in old.columns:
-                            old["date_iso"] = pd.to_datetime(old["date_iso"], errors="coerce").dt.date.astype(str)
-                            old.loc[old["date_iso"] == "NaT", "date_iso"] = ""
-                        for c in COLS:
-                            if c not in old.columns:
-                                old[c] = ""
-                        old["confidence"] = "นำเข้าจาก Excel"
-                        old["import_method"] = "excel-migration"
-                        old = old[old["substitute_teacher"].astype(str).str.strip().ne("")]
-                        st.dataframe(old, use_container_width=True, hide_index=True)
-                        if st.button("ยืนยันนำเข้า Excel", type="primary"):
-                            recs = [normalize_record(r) for r in old.fillna("").to_dict("records")]
-                            added, skipped = insert_records(
-                                recs, f"excel-{old_xlsx.name}-{len(old_xlsx.getvalue())}", old_xlsx.name,
-                                "excel-migration", username=username,
-                            )
-                            st.success(f"นำเข้า {added} รายการ | ข้าม {skipped} รายการ")
-                except Exception as exc:
-                    st.error(f"อ่าน Excel ไม่สำเร็จ: {exc}")
-
-    with tab_map["ส่งออก"]:
-        df = df_all()
-        st.write(f"ข้อมูลในฐาน {len(df)} รายการ")
-        st.download_button(
-            "ดาวน์โหลด Excel ทั้งหมด", make_excel(df), "รายงานการสอนแทน_ทั้งหมด.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    with tab_map["ประวัติไฟล์"]:
-        hist = imported_files_df()
-        st.dataframe(hist, use_container_width=True, hide_index=True)
-        if not hist.empty and "storage_key" in hist.columns:
-            candidates = hist[hist["storage_key"].fillna("").astype(str).str.strip().ne("")]
-            if not candidates.empty:
-                choices = candidates["file_hash"].astype(str).tolist()
-                selected_hash = st.selectbox(
-                    "ดาวน์โหลดไฟล์ต้นฉบับที่เก็บไว้",
-                    choices,
-                    format_func=lambda h: str(candidates[candidates["file_hash"] == h]["file_name"].iloc[0]),
-                )
-                row = candidates[candidates["file_hash"] == selected_hash].iloc[0]
-                try:
-                    original = load_file(str(row["storage_key"]))
-                    if original:
-                        st.download_button("ดาวน์โหลดไฟล์ต้นฉบับ", original, str(row["file_name"]), "application/octet-stream")
-                    else:
-                        st.caption("ไม่พบไฟล์ต้นฉบับใน Storage ปัจจุบัน")
-                except Exception as exc:
-                    st.warning(f"เปิดไฟล์ต้นฉบับไม่สำเร็จ: {exc}")
-
-    if "ย้ายจาก V3" in tab_map:
-        with tab_map["ย้ายจาก V3"]:
-            st.write("สำหรับฐานข้อมูล `substitution.db` จาก V3: ระบบจะนำ records และ settings เข้าฐาน V4 โดยไม่ลบข้อมูล V4 เดิม")
-            v3db = st.file_uploader("เลือก substitution.db จาก V3", type=["db"], key="v3db")
-            if v3db:
-                try:
-                    payload = read_v3_sqlite_bytes(v3db.getvalue())
-                    st.info(f"พบ {len(payload.get('records', []))} รายการใน V3")
-                    if st.button("ยืนยันย้าย V3 → V4", type="primary"):
-                        result = migrate_v3_payload(payload, username)
-                        st.success(f"ย้ายแล้ว {result['added']} รายการ | ข้ามซ้ำ {result['skipped']} รายการ")
-                except Exception as exc:
-                    st.error(str(exc))
-
-    if "สำรอง/กู้คืน V4" in tab_map:
-        with tab_map["สำรอง/กู้คืน V4"]:
-            st.download_button(
-                "ดาวน์โหลด Portable Backup V4 (.zip)", make_portable_backup_bytes(),
-                "substitution_v4_backup.zip", "application/zip", type="primary",
-            )
-            st.caption("Portable Backup เก็บข้อมูลการสอนแทน ประวัติไฟล์ และการตั้งค่า แต่ไม่ส่งออกรหัสผ่านผู้ใช้")
-            backup = st.file_uploader("เลือก substitution_v4_backup.zip เพื่อกู้คืน", type=["zip"], key="restore_v4")
-            confirm_restore = st.checkbox("ยืนยัน: การกู้คืนจะล้าง records/imported_files ปัจจุบัน แต่จะไม่ลบบัญชีผู้ใช้")
-            if st.button("กู้คืน V4", disabled=not (backup and confirm_restore)):
-                try:
-                    result = restore_portable_backup_bytes(backup.getvalue(), username)
-                    st.success(f"กู้คืนแล้ว {result['records']} รายการ และประวัติไฟล์ {result['files']} รายการ")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
-
-elif page == "ตั้งค่า / ระบบ":
-    require_permission("settings")
-    st.subheader("⚙️ ตั้งค่าระบบ")
-    settings = get_settings()
-    tab1, tab2, tab3 = st.tabs(["โรงเรียนและรายงาน", "ปีการศึกษา", "ตรวจระบบ/ออนไลน์"])
-    with tab1:
-        with st.form("school_settings"):
-            title = st.text_input("ชื่อระบบ", settings.get("app_title", "ระบบนับและสรุปการสอนแทน"))
-            school = st.text_input("ชื่อโรงเรียน", settings.get("school_name", ""))
-            head = st.text_input("หัวหน้าบริหารงานวิชาการ", settings.get("academic_head_name", ""))
-            director = st.text_input("ผู้อำนวยการสถานศึกษา", settings.get("director_name", ""))
-            periods = st.number_input("จำนวนคาบต่อวัน", 1, 20, int(settings.get("periods_per_day", "6")))
-            if st.form_submit_button("บันทึกการตั้งค่า", type="primary"):
-                set_settings({
-                    "app_title": title, "school_name": school, "academic_head_name": head,
-                    "director_name": director, "periods_per_day": periods,
-                }, username=username)
-                st.success("บันทึกแล้ว")
-
-    with tab2:
-        st.write("กำหนดช่วงปีการศึกษาในรูปแบบ เดือน-วัน (MM-DD)")
-        with st.form("year_settings"):
-            start = st.text_input("เริ่มปีการศึกษา", settings.get("academic_year_start", "05-01"))
-            term1_end = st.text_input("สิ้นสุดภาคเรียนที่ 1", settings.get("term1_end", "10-31"))
-            term2_start = st.text_input("เริ่มภาคเรียนที่ 2", settings.get("term2_start", "11-01"))
-            term2_end = st.text_input("สิ้นสุดภาคเรียนที่ 2", settings.get("term2_end", "04-30"))
-            if st.form_submit_button("บันทึกช่วงปีการศึกษา"):
-                try:
-                    for v in [start, term1_end, term2_start, term2_end]:
-                        datetime.strptime(v, "%m-%d")
-                    set_settings({
-                        "academic_year_start": start, "term1_end": term1_end,
-                        "term2_start": term2_start, "term2_end": term2_end,
-                    }, username=username)
-                    st.success("บันทึกแล้ว")
-                except ValueError:
-                    st.error("กรุณาใช้รูปแบบ MM-DD เช่น 05-01")
-
-    with tab3:
-        ocr = tesseract_status()
-        lo_ok, lo_path = libreoffice_status()
-        storage = storage_status()
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**ฐานข้อมูล**")
-            if database_kind() == "PostgreSQL":
-                st.success("PostgreSQL — เหมาะสำหรับออนไลน์หลายผู้ใช้")
-            else:
-                st.warning("SQLite — เหมาะสำหรับ Local/Test; Production ควรตั้ง DATABASE_URL เป็น PostgreSQL")
-            st.code(safe_database_url())
-        with c2:
-            st.markdown("**OCR / LibreOffice**")
-            if ocr["available"] and ocr["thai"]:
-                st.success(f"Tesseract {ocr['version']} + ภาษาไทย พร้อม")
-            elif ocr["available"]:
-                st.warning("พบ Tesseract แต่ยังไม่มีภาษาไทย (tha)")
-            else:
-                st.error("ยังไม่พบ Tesseract OCR")
-            st.caption(ocr.get("path", ""))
-            if lo_ok:
-                st.success("LibreOffice พร้อม")
-            else:
-                st.warning("ยังไม่พบ LibreOffice")
-            st.caption(lo_path)
-        with c3:
-            st.markdown("**Document Storage**")
-            if storage["mode"] == "S3":
-                st.success(f"S3/Object Storage: {storage.get('bucket')}")
-            else:
-                st.warning("Local Storage ชั่วคราว — บน Streamlit Cloud ไฟล์ต้นฉบับอาจหายเมื่อแอปรีสตาร์ต แนะนำ Supabase Storage")
-            st.caption(storage.get("message", ""))
-
-        st.markdown("#### ข้อมูลตัวอย่าง")
-        all_df = df_all()
-        sample_count = len(all_df[all_df["source_hash"] == "sample-seed"]) if not all_df.empty else 0
-        st.write(f"ข้อมูลตัวอย่างคงเหลือ {sample_count} รายการ")
-        confirm_clear = st.checkbox("ยืนยันลบข้อมูลตัวอย่าง 15 คาบ")
-        if st.button("ลบข้อมูลตัวอย่าง", disabled=not confirm_clear):
-            n = clear_sample_records(username=username)
-            st.success(f"ลบข้อมูลตัวอย่างแล้ว {n} รายการ และจะไม่สร้างกลับอัตโนมัติ")
-            st.rerun()
-
-
-elif page == "ผู้ใช้งาน / Audit":
-    require_permission("users")
-    st.subheader("👥 ผู้ใช้งานและประวัติการทำงาน")
-    t1, t2, t3 = st.tabs(["รายชื่อผู้ใช้", "สร้าง/แก้บัญชี", "Audit Log"])
-    with t1:
-        udf = list_users_df()
-        show = udf.copy()
-        if not show.empty:
-            show["role_name"] = show["role"].map(ROLE_LABELS).fillna(show["role"])
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-    with t2:
-        st.markdown("#### สร้างผู้ใช้ใหม่")
-        with st.form("create_user"):
-            c1, c2 = st.columns(2)
-            new_username = c1.text_input("Username")
-            new_name = c2.text_input("ชื่อที่แสดง")
-            c3, c4 = st.columns(2)
-            new_role = c3.selectbox("สิทธิ์", list(ROLE_LABELS.keys()), format_func=lambda x: ROLE_LABELS[x])
-            new_password = c4.text_input("รหัสผ่านชั่วคราว", type="password")
-            create_ok = st.form_submit_button("สร้างบัญชี", type="primary")
-        if create_ok:
-            try:
-                create_user(new_username, new_password, new_name, new_role, created_by=username, must_change_password=True)
-                st.success("สร้างบัญชีแล้ว ผู้ใช้จะถูกบังคับเปลี่ยนรหัสผ่านเมื่อเข้าใช้ครั้งแรก")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-
-        udf = list_users_df()
-        if not udf.empty:
-            st.markdown("#### แก้บัญชี")
-            uid = st.selectbox("เลือกผู้ใช้", udf["id"].astype(int).tolist(), format_func=lambda i: f"{udf[udf['id']==i]['username'].iloc[0]} — {udf[udf['id']==i]['display_name'].iloc[0]}")
-            row = udf[udf["id"] == uid].iloc[0]
-            with st.form("edit_user"):
-                e_name = st.text_input("ชื่อที่แสดง", str(row["display_name"]))
-                e_role = st.selectbox("สิทธิ์", list(ROLE_LABELS.keys()), index=list(ROLE_LABELS.keys()).index(str(row["role"])), format_func=lambda x: ROLE_LABELS[x])
-                e_active = st.checkbox("เปิดใช้งานบัญชี", value=bool(row["active"]))
-                edit_ok = st.form_submit_button("บันทึกบัญชี")
-            if edit_ok:
-                try:
-                    update_user(int(uid), e_name, e_role, e_active, changed_by=username)
-                    st.success("บันทึกแล้ว")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
-            with st.form("reset_password"):
-                reset_pw = st.text_input("รหัสผ่านชั่วคราวใหม่", type="password")
-                reset_ok = st.form_submit_button("รีเซ็ตรหัสผ่าน")
-            if reset_ok:
-                try:
-                    reset_user_password(int(uid), reset_pw, changed_by=username, must_change=True)
-                    st.success("รีเซ็ตรหัสผ่านแล้ว ผู้ใช้จะต้องเปลี่ยนรหัสผ่านเมื่อเข้าใช้งานครั้งถัดไป")
-                except Exception as exc:
-                    st.error(str(exc))
-
-    with t3:
-        limit = st.selectbox("จำนวนรายการล่าสุด", [100, 500, 1000, 5000], index=1)
-        adf = audit_df(limit)
-        st.dataframe(adf, use_container_width=True, hide_index=True)
-        if not adf.empty:
-            st.download_button("ดาวน์โหลด Audit Log CSV", adf.to_csv(index=False).encode("utf-8-sig"), "audit_log.csv", "text/csv")
-
-
-elif page == "บัญชีของฉัน":
-    st.subheader("🔐 บัญชีของฉัน")
-    st.write(f"**ผู้ใช้:** {username}")
-    st.write(f"**ชื่อ:** {user.get('display_name', '')}")
-    st.write(f"**สิทธิ์:** {ROLE_LABELS.get(role, role)}")
-    with st.form("change_my_password"):
-        old = st.text_input("รหัสผ่านเดิม", type="password")
-        new1 = st.text_input("รหัสผ่านใหม่", type="password")
-        new2 = st.text_input("ยืนยันรหัสผ่านใหม่", type="password")
-        ok = st.form_submit_button("เปลี่ยนรหัสผ่าน")
-    if ok:
-        if new1 != new2:
-            st.error("รหัสผ่านใหม่ไม่ตรงกัน")
-        else:
-            try:
-                change_own_password(username, old, new1)
-                st.success("เปลี่ยนรหัสผ่านเรียบร้อย")
-            except Exception as exc:
-                st.error(str(exc))
-
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["eligible", "score", "substitute_count", "daily_load", "teacher"], ascending=[False, True, True, True, True]).reset_index(drop=True)
 
