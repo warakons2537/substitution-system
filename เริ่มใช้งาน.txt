@@ -1,0 +1,15 @@
+ระบบนับและสรุปการสอนแทน V4.1 FreeCloud
+
+สำหรับขึ้นออนไลน์แบบง่าย:
+1) สร้าง Supabase Project
+2) Copy ค่า Connect > Session pooler
+3) อัปโฟลเดอร์นี้ขึ้น GitHub
+4) Deploy app.py บน Streamlit Community Cloud
+5) ใส่ Secrets ตามไฟล์ .streamlit/secrets.example.toml
+
+อ่านรายละเอียดที่: เริ่มที่นี่_FreeCloud.md
+
+หมายเหตุ:
+- ห้ามอัป secrets.toml จริงขึ้น GitHub
+- ไม่มีข้อมูลตัวอย่าง 15 คาบโดยอัตโนมัติ
+- บน Cloud ต้องกำหนด BOOTSTRAP_ADMIN_PASSWORD เอง

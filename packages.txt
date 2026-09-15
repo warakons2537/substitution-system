@@ -1,0 +1,5 @@
+tesseract-ocr
+tesseract-ocr-tha
+libreoffice-core
+libreoffice-writer
+fonts-thai-tlwg
