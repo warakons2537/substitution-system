@@ -1,0 +1,17 @@
+# Secrets / credentials
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+substitution_v4.db
+*.db-journal
+uploads/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
