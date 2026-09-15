@@ -107,6 +107,46 @@ audit_logs = Table(
     Column("detail", Text, default=""),
 )
 
+# ตารางสอนสำหรับโมดูลช่วยจัดครูสอนแทน
+timetable_entries = Table(
+    "timetable_entries", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("academic_year", Integer, nullable=False),
+    Column("term", Integer, nullable=False),
+    Column("weekday", String(32), nullable=False),
+    Column("period", Integer, nullable=False),
+    Column("class_name", String(64), default=""),
+    Column("subject", Text, default=""),
+    Column("teacher", Text, nullable=False),
+    Column("teacher_slot", Integer, default=1),
+    Column("source_hash", String(128), default=""),
+    Column("imported_at", String(40), default=""),
+)
+
+timetable_imports = Table(
+    "timetable_imports", metadata,
+    Column("file_hash", String(128), primary_key=True),
+    Column("file_name", Text, default=""),
+    Column("academic_year", Integer, nullable=False),
+    Column("term", Integer, nullable=False),
+    Column("imported_at", String(40), default=""),
+    Column("row_count", Integer, default=0),
+    Column("teacher_count", Integer, default=0),
+    Column("warning_text", Text, default=""),
+    Column("uploaded_by", String(128), default=""),
+)
+
+teacher_unavailability = Table(
+    "teacher_unavailability", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("date_iso", String(10), nullable=False),
+    Column("teacher", Text, nullable=False),
+    Column("period", Integer, default=0),
+    Column("reason", Text, default=""),
+    Column("created_by", String(128), default=""),
+    Column("created_at", String(40), default=""),
+)
+
 COLS = [
     "date_iso", "day_name", "thai_year", "absent_teacher", "leave_type", "period",
     "subject", "class_name", "substitute_teacher", "acknowledged", "note", "source_file",
@@ -147,8 +187,8 @@ DEFAULT_SETTINGS = {
 
 ROLE_LABELS = {"admin": "ผู้ดูแลระบบ", "academic": "ฝ่ายวิชาการ", "viewer": "ผู้ดูข้อมูล"}
 PERMISSIONS = {
-    "admin": {"upload", "manual", "delete", "export", "settings", "users", "restore", "view", "report"},
-    "academic": {"upload", "manual", "delete", "export", "view", "report"},
+    "admin": {"upload", "manual", "delete", "export", "settings", "users", "restore", "view", "report", "timetable"},
+    "academic": {"upload", "manual", "delete", "export", "view", "report", "timetable"},
     "viewer": {"export", "view", "report"},
 }
 
@@ -468,11 +508,17 @@ def make_portable_backup_bytes() -> bytes:
     rec_df = df_all()
     file_df = imported_files_df()
     user_df = list_users_df()
+    tt_df = timetable_df()
+    tt_imp_df = timetable_imports_df()
+    ua_df = unavailability_df()
     payload = {
         "version": 4,
         "created_at": now_iso(),
         "records": rec_df.where(pd.notna(rec_df), None).to_dict("records"),
         "imported_files": file_df.where(pd.notna(file_df), None).to_dict("records"),
+        "timetable_entries": tt_df.where(pd.notna(tt_df), None).to_dict("records"),
+        "timetable_imports": tt_imp_df.where(pd.notna(tt_imp_df), None).to_dict("records"),
+        "teacher_unavailability": ua_df.where(pd.notna(ua_df), None).to_dict("records"),
         "settings": get_settings(),
         "users_public": user_df.where(pd.notna(user_df), None).to_dict("records"),
     }
@@ -491,10 +537,16 @@ def restore_portable_backup_bytes(data: bytes, username: str) -> dict:
         raise ValueError("ไฟล์สำรองไม่ใช่ V4 ที่รองรับ")
     rec_rows = payload.get("records", [])
     file_rows = payload.get("imported_files", [])
+    tt_rows = payload.get("timetable_entries", [])
+    tt_import_rows = payload.get("timetable_imports", [])
+    ua_rows = payload.get("teacher_unavailability", [])
     settings = payload.get("settings", {})
     with ENGINE.begin() as con:
         con.execute(delete(records))
         con.execute(delete(imported_files))
+        con.execute(delete(timetable_entries))
+        con.execute(delete(timetable_imports))
+        con.execute(delete(teacher_unavailability))
         for r in rec_rows:
             vals = {c.name: r.get(c.name) for c in records.columns if c.name != "id"}
             if not vals.get("record_hash"):
@@ -506,6 +558,18 @@ def restore_portable_backup_bytes(data: bytes, username: str) -> dict:
             fh = vals.get("file_hash")
             if fh and con.execute(select(imported_files.c.file_hash).where(imported_files.c.file_hash == fh)).first() is None:
                 con.execute(insert(imported_files).values(**vals))
+        for row in tt_rows:
+            vals = {c.name: row.get(c.name) for c in timetable_entries.columns if c.name != "id"}
+            if vals.get("academic_year") and vals.get("term") and vals.get("teacher"):
+                con.execute(insert(timetable_entries).values(**vals))
+        for row in tt_import_rows:
+            vals = {c.name: row.get(c.name) for c in timetable_imports.columns}
+            if vals.get("file_hash"):
+                con.execute(insert(timetable_imports).values(**vals))
+        for row in ua_rows:
+            vals = {c.name: row.get(c.name) for c in teacher_unavailability.columns if c.name != "id"}
+            if vals.get("date_iso") and vals.get("teacher"):
+                con.execute(insert(teacher_unavailability).values(**vals))
         for k, v in settings.items():
             exists = con.execute(select(settings_table.c.key).where(settings_table.c.key == str(k))).first()
             if exists:
@@ -513,7 +577,7 @@ def restore_portable_backup_bytes(data: bytes, username: str) -> dict:
             else:
                 con.execute(insert(settings_table).values(key=str(k), value=str(v)))
     audit_event(username, "backup.restore", "database", "portable", {"records": len(rec_rows), "files": len(file_rows)})
-    return {"records": len(rec_rows), "files": len(file_rows)}
+    return {"records": len(rec_rows), "files": len(file_rows), "timetable": len(tt_rows), "unavailability": len(ua_rows)}
 
 
 def read_v3_sqlite_bytes(data: bytes) -> dict:
@@ -585,3 +649,177 @@ def term_bounds(academic_year_th: int, term: int, settings: dict[str, str]) -> t
     start = date(gy, sm, sd)
     end_year = gy + 1 if (em, ed) < (sm, sd) else gy
     return start, date(end_year, em, ed)
+
+
+# ---------------- Timetable / substitute-assist ----------------
+def timetable_df(academic_year: int | None = None, term: int | None = None) -> pd.DataFrame:
+    stmt = select(timetable_entries)
+    if academic_year is not None:
+        stmt = stmt.where(timetable_entries.c.academic_year == int(academic_year))
+    if term is not None:
+        stmt = stmt.where(timetable_entries.c.term == int(term))
+    stmt = stmt.order_by(
+        timetable_entries.c.academic_year.desc(), timetable_entries.c.term.asc(),
+        timetable_entries.c.weekday.asc(), timetable_entries.c.period.asc(),
+        timetable_entries.c.class_name.asc(), timetable_entries.c.teacher.asc(),
+    )
+    with ENGINE.connect() as con:
+        return pd.read_sql(stmt, con)
+
+
+def timetable_imports_df() -> pd.DataFrame:
+    with ENGINE.connect() as con:
+        return pd.read_sql(select(timetable_imports).order_by(timetable_imports.c.imported_at.desc()), con)
+
+
+def import_timetable(
+    entries: list[dict], academic_year: int, term: int, source_hash: str, source_name: str,
+    teacher_count: int = 0, warning_text: str = "", username: str = "system",
+) -> int:
+    academic_year = int(academic_year)
+    term = int(term)
+    if term not in (1, 2):
+        raise ValueError("ภาคเรียนต้องเป็น 1 หรือ 2")
+    clean_rows = []
+    seen = set()
+    for e in entries:
+        try:
+            period = int(e.get("period") or 0)
+        except Exception:
+            period = 0
+        weekday = str(e.get("weekday") or "").strip()
+        teacher = str(e.get("teacher") or "").replace("\xa0", " ").strip()
+        subject = str(e.get("subject") or "").strip()
+        cls = str(e.get("class_name") or "").strip()
+        if not weekday or period <= 0 or not teacher:
+            continue
+        key = (weekday, period, cls, subject, teacher)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_rows.append(dict(
+            academic_year=academic_year, term=term, weekday=weekday, period=period,
+            class_name=cls, subject=subject, teacher=teacher,
+            teacher_slot=int(e.get("teacher_slot") or 1), source_hash=source_hash, imported_at=now_iso(),
+        ))
+    if not clean_rows:
+        raise ValueError("ไม่พบรายการตารางสอนที่บันทึกได้")
+
+    with ENGINE.begin() as con:
+        con.execute(delete(timetable_entries).where(
+            (timetable_entries.c.academic_year == academic_year) &
+            (timetable_entries.c.term == term)
+        ))
+        con.execute(insert(timetable_entries), clean_rows)
+        vals = dict(
+            file_name=source_name, academic_year=academic_year, term=term, imported_at=now_iso(),
+            row_count=len(clean_rows), teacher_count=int(teacher_count or 0),
+            warning_text=warning_text, uploaded_by=username or "system",
+        )
+        exists = con.execute(select(timetable_imports.c.file_hash).where(timetable_imports.c.file_hash == source_hash)).first()
+        if exists:
+            con.execute(update(timetable_imports).where(timetable_imports.c.file_hash == source_hash).values(**vals))
+        else:
+            con.execute(insert(timetable_imports).values(file_hash=source_hash, **vals))
+    audit_event(username, "timetable.import", "timetable", f"{academic_year}-{term}", {
+        "file": source_name, "rows": len(clean_rows), "teachers": int(teacher_count or 0),
+    })
+    return len(clean_rows)
+
+
+def unavailability_df(date_iso: str | None = None) -> pd.DataFrame:
+    stmt = select(teacher_unavailability)
+    if date_iso:
+        stmt = stmt.where(teacher_unavailability.c.date_iso == str(date_iso)[:10])
+    stmt = stmt.order_by(teacher_unavailability.c.date_iso.desc(), teacher_unavailability.c.period.asc(), teacher_unavailability.c.teacher.asc())
+    with ENGINE.connect() as con:
+        return pd.read_sql(stmt, con)
+
+
+def add_unavailability(date_iso: str, teacher: str, period: int = 0, reason: str = "", username: str = "system") -> int:
+    teacher = str(teacher or "").strip()
+    if not teacher:
+        raise ValueError("กรุณาระบุชื่อครู")
+    vals = dict(date_iso=str(date_iso)[:10], teacher=teacher, period=int(period or 0), reason=str(reason or "").strip(), created_by=username, created_at=now_iso())
+    with ENGINE.begin() as con:
+        result = con.execute(insert(teacher_unavailability).values(**vals))
+        rid = int(result.inserted_primary_key[0])
+    audit_event(username, "teacher.unavailable.add", "teacher_unavailability", str(rid), vals)
+    return rid
+
+
+def delete_unavailability(ids: Iterable[int], username: str = "system") -> int:
+    ids = [int(x) for x in ids]
+    if not ids:
+        return 0
+    with ENGINE.begin() as con:
+        result = con.execute(delete(teacher_unavailability).where(teacher_unavailability.c.id.in_(ids)))
+        n = int(result.rowcount or 0)
+    audit_event(username, "teacher.unavailable.delete", "teacher_unavailability", ",".join(map(str, ids)), {"count": n})
+    return n
+
+
+def recommend_substitutes(
+    date_iso: str, academic_year: int, term: int, period: int, absent_teacher: str, subject: str = "",
+    exclude_group_teachers: bool = True,
+) -> pd.DataFrame:
+    d = date.fromisoformat(str(date_iso)[:10])
+    day_names = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+    weekday = day_names[d.weekday()]
+    period = int(period)
+    tt = timetable_df(int(academic_year), int(term))
+    if tt.empty:
+        return pd.DataFrame()
+    day = tt[tt["weekday"].astype(str) == weekday].copy()
+    all_teachers = sorted(x for x in tt["teacher"].dropna().astype(str).str.strip().unique() if x)
+    busy = set(day.loc[day["period"].astype(int) == period, "teacher"].astype(str).str.strip())
+
+    rec = df_all()
+    same_date = rec[rec["date_iso"].astype(str) == str(date_iso)[:10]].copy() if not rec.empty else rec
+    already_sub = set()
+    if not same_date.empty:
+        already_sub = set(same_date.loc[same_date["period"].fillna(0).astype(int) == period, "substitute_teacher"].astype(str).str.strip())
+    hist_counts = rec["substitute_teacher"].astype(str).str.strip().value_counts().to_dict() if not rec.empty else {}
+
+    ua = unavailability_df(str(date_iso)[:10])
+    unavailable = set()
+    if not ua.empty:
+        u = ua[(ua["period"].fillna(0).astype(int).isin([0, period]))]
+        unavailable = set(u["teacher"].astype(str).str.strip())
+
+    subject = str(subject or "").strip()
+    rows = []
+    for teacher in all_teachers:
+        if teacher == str(absent_teacher or "").strip():
+            continue
+        if exclude_group_teachers and ("ลส.-" in teacher or "สำรอง" in teacher):
+            continue
+        reasons = []
+        eligible = True
+        if teacher in busy:
+            eligible = False
+            reasons.append("มีสอนคาบนี้")
+        if teacher in already_sub:
+            eligible = False
+            reasons.append("ถูกจัดสอนแทนคาบนี้แล้ว")
+        if teacher in unavailable:
+            eligible = False
+            reasons.append("ไม่ว่าง/ติดภารกิจ")
+        daily_load = int((day["teacher"].astype(str).str.strip() == teacher).sum())
+        substitute_count = int(hist_counts.get(teacher, 0))
+        subject_match = False
+        if subject:
+            subject_match = bool(((tt["teacher"].astype(str).str.strip() == teacher) & (tt["subject"].astype(str).str.strip() == subject)).any())
+        score = substitute_count * 10 + daily_load * 2 + (0 if subject_match else 4)
+        if not eligible:
+            score += 10000
+        rows.append({
+            "teacher": teacher, "eligible": eligible, "status": "ว่าง" if eligible else " / ".join(reasons),
+            "substitute_count": substitute_count, "daily_load": daily_load,
+            "subject_match": "ตรงวิชา" if subject_match else "", "score": score,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["eligible", "score", "substitute_count", "daily_load", "teacher"], ascending=[False, True, True, True, True]).reset_index(drop=True)
+
