@@ -433,6 +433,68 @@ def delete_records(ids: Iterable[int], username: str = "system") -> int:
     return n
 
 
+def delete_import_batches(source_hashes: Iterable[str], username: str = "system") -> dict:
+    """Delete one or more complete import batches and their import-history rows atomically.
+
+    This is intended for correcting an accidentally imported document/file. Historical audit
+    logs are retained so administrators can still see what was removed and by whom.
+    """
+    hashes = [str(x).strip() for x in source_hashes if str(x).strip()]
+    hashes = list(dict.fromkeys(hashes))
+    if not hashes:
+        return {"batches": 0, "records": 0, "files": []}
+
+    with ENGINE.begin() as con:
+        file_rows = con.execute(
+            select(imported_files.c.file_hash, imported_files.c.file_name, imported_files.c.imported_rows)
+            .where(imported_files.c.file_hash.in_(hashes))
+        ).all()
+        names = [str(r.file_name or r.file_hash) for r in file_rows]
+        rec_result = con.execute(delete(records).where(records.c.source_hash.in_(hashes)))
+        rec_count = int(rec_result.rowcount or 0)
+        file_result = con.execute(delete(imported_files).where(imported_files.c.file_hash.in_(hashes)))
+        batch_count = int(file_result.rowcount or 0)
+
+    audit_event(
+        username, "records.batch_delete", "import_batch", ",".join(hashes),
+        {"batches": batch_count, "records": rec_count, "files": names},
+    )
+    return {"batches": batch_count, "records": rec_count, "files": names}
+
+
+def delete_records_by_filter(
+    *, source_hashes: Iterable[str] | None = None, date_from: str = "", date_to: str = "",
+    absent_teacher: str = "", substitute_teacher: str = "", username: str = "system",
+) -> int:
+    """Bulk delete records matching explicit filters. At least one filter is required."""
+    stmt = delete(records)
+    filters = []
+    hashes = [str(x).strip() for x in (source_hashes or []) if str(x).strip()]
+    if hashes:
+        filters.append(records.c.source_hash.in_(hashes))
+    if date_from:
+        filters.append(records.c.date_iso >= str(date_from))
+    if date_to:
+        filters.append(records.c.date_iso <= str(date_to))
+    if absent_teacher:
+        filters.append(records.c.absent_teacher == str(absent_teacher))
+    if substitute_teacher:
+        filters.append(records.c.substitute_teacher == str(substitute_teacher))
+    if not filters:
+        return 0
+    for f in filters:
+        stmt = stmt.where(f)
+    with ENGINE.begin() as con:
+        result = con.execute(stmt)
+        n = int(result.rowcount or 0)
+    audit_event(username, "records.bulk_delete", "record", "filtered", {
+        "count": n, "date_from": date_from, "date_to": date_to,
+        "absent_teacher": absent_teacher, "substitute_teacher": substitute_teacher,
+        "source_hashes": hashes,
+    })
+    return n
+
+
 def clear_sample_records(username: str = "system") -> int:
     with ENGINE.begin() as con:
         result = con.execute(delete(records).where(records.c.source_hash == "sample-seed"))
@@ -829,6 +891,12 @@ def recommend_substitutes(
     date_iso: str, academic_year: int, term: int, period: int, absent_teacher: str, subject: str = "",
     exclude_group_teachers: bool = True,
 ) -> pd.DataFrame:
+    """Recommend available substitute teachers with weekly fairness as the primary ranking signal.
+
+    Fairness window follows Monday-Sunday of the requested date. Historical records are preserved
+    and only used as transparent ranking signals; no teacher is automatically blocked solely because
+    they have already substituted several times.
+    """
     d = date.fromisoformat(str(date_iso)[:10])
     day_names = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
     weekday = day_names[d.weekday()]
@@ -836,19 +904,56 @@ def recommend_substitutes(
     tt = timetable_df(int(academic_year), int(term))
     if tt.empty:
         return pd.DataFrame()
+
     day = tt[tt["weekday"].astype(str) == weekday].copy()
     inactive = inactive_teachers()
-    all_teachers = sorted(x for x in tt["teacher"].dropna().astype(str).str.strip().unique() if x and x not in inactive)
+    all_teachers = sorted(
+        x for x in tt["teacher"].dropna().astype(str).str.strip().unique()
+        if x and x not in inactive
+    )
     busy = set(day.loc[day["period"].astype(int) == period, "teacher"].astype(str).str.strip())
 
     rec = df_all()
-    same_date = rec[rec["date_iso"].astype(str) == str(date_iso)[:10]].copy() if not rec.empty else rec
+    target_iso = d.isoformat()
+    same_date = rec[rec["date_iso"].astype(str) == target_iso].copy() if not rec.empty else rec
     already_sub = set()
     if not same_date.empty:
-        already_sub = set(same_date.loc[same_date["period"].fillna(0).astype(int) == period, "substitute_teacher"].astype(str).str.strip())
-    hist_counts = rec["substitute_teacher"].astype(str).str.strip().value_counts().to_dict() if not rec.empty else {}
+        already_sub = set(
+            same_date.loc[
+                same_date["period"].fillna(0).astype(int) == period,
+                "substitute_teacher",
+            ].astype(str).str.strip()
+        )
 
-    ua = unavailability_df(str(date_iso)[:10])
+    # Fairness windows: today, current Monday-Sunday week, current month, and all-time history.
+    week_start = d - pd.Timedelta(days=d.weekday())
+    week_end = week_start + pd.Timedelta(days=6)
+    month_prefix = d.strftime("%Y-%m")
+
+    hist_counts = {}
+    daily_sub_counts = {}
+    weekly_sub_counts = {}
+    monthly_sub_counts = {}
+    last_sub_dates = {}
+    if not rec.empty:
+        hist = rec.copy()
+        hist["_sub"] = hist["substitute_teacher"].fillna("").astype(str).str.strip()
+        hist = hist[hist["_sub"].ne("")].copy()
+        hist["_date"] = pd.to_datetime(hist["date_iso"].astype(str).str[:10], errors="coerce")
+        hist = hist[hist["_date"].notna()].copy()
+        if not hist.empty:
+            hist_counts = hist["_sub"].value_counts().to_dict()
+            daily_sub_counts = hist.loc[hist["_date"].dt.date == d, "_sub"].value_counts().to_dict()
+            weekly_mask = (hist["_date"].dt.date >= week_start.date()) & (hist["_date"].dt.date <= week_end.date())
+            weekly_sub_counts = hist.loc[weekly_mask, "_sub"].value_counts().to_dict()
+            monthly_mask = hist["_date"].dt.strftime("%Y-%m") == month_prefix
+            monthly_sub_counts = hist.loc[monthly_mask, "_sub"].value_counts().to_dict()
+            past_or_today = hist[hist["_date"].dt.date <= d]
+            if not past_or_today.empty:
+                latest = past_or_today.groupby("_sub")["_date"].max()
+                last_sub_dates = {k: v.date().isoformat() for k, v in latest.items()}
+
+    ua = unavailability_df(target_iso)
     unavailable = set()
     if not ua.empty:
         u = ua[(ua["period"].fillna(0).astype(int).isin([0, period]))]
@@ -861,6 +966,7 @@ def recommend_substitutes(
             continue
         if exclude_group_teachers and ("ลส.-" in teacher or "สำรอง" in teacher):
             continue
+
         reasons = []
         eligible = True
         if teacher in busy:
@@ -872,20 +978,63 @@ def recommend_substitutes(
         if teacher in unavailable:
             eligible = False
             reasons.append("ไม่ว่าง/ติดภารกิจ")
+
         daily_load = int((day["teacher"].astype(str).str.strip() == teacher).sum())
         substitute_count = int(hist_counts.get(teacher, 0))
+        daily_sub_count = int(daily_sub_counts.get(teacher, 0))
+        weekly_sub_count = int(weekly_sub_counts.get(teacher, 0))
+        monthly_sub_count = int(monthly_sub_counts.get(teacher, 0))
+        last_sub_date = str(last_sub_dates.get(teacher, ""))
+
         subject_match = False
         if subject:
-            subject_match = bool(((tt["teacher"].astype(str).str.strip() == teacher) & (tt["subject"].astype(str).str.strip() == subject)).any())
-        score = substitute_count * 10 + daily_load * 2 + (0 if subject_match else 4)
+            subject_match = bool(
+                ((tt["teacher"].astype(str).str.strip() == teacher) &
+                 (tt["subject"].astype(str).str.strip() == subject)).any()
+            )
+
+        # Weekly fairness dominates the ranking. A teacher with fewer substitutions this week
+        # is preferred before all-time totals, daily teaching load, and subject match.
+        score = (
+            weekly_sub_count * 100
+            + daily_sub_count * 25
+            + substitute_count * 3
+            + daily_load * 2
+            + (0 if subject_match else 4)
+        )
         if not eligible:
             score += 10000
+
+        fairness_note = ""
+        if weekly_sub_count >= 3:
+            fairness_note = "สอนแทนสัปดาห์นี้หลายครั้ง — ควรพิจารณาครูอื่นก่อน"
+        elif weekly_sub_count == 2:
+            fairness_note = "สอนแทนสัปดาห์นี้ 2 ครั้ง — ลดลำดับคำแนะนำ"
+        elif weekly_sub_count == 1:
+            fairness_note = "สอนแทนสัปดาห์นี้แล้ว 1 ครั้ง"
+        else:
+            fairness_note = "ยังไม่สอนแทนในสัปดาห์นี้"
+
         rows.append({
-            "teacher": teacher, "eligible": eligible, "status": "ว่าง" if eligible else " / ".join(reasons),
-            "substitute_count": substitute_count, "daily_load": daily_load,
-            "subject_match": "ตรงวิชา" if subject_match else "", "score": score,
+            "teacher": teacher,
+            "eligible": eligible,
+            "status": "ว่าง" if eligible else " / ".join(reasons),
+            "weekly_sub_count": weekly_sub_count,
+            "daily_sub_count": daily_sub_count,
+            "monthly_sub_count": monthly_sub_count,
+            "substitute_count": substitute_count,
+            "daily_load": daily_load,
+            "subject_match": "ตรงวิชา" if subject_match else "",
+            "last_sub_date": last_sub_date,
+            "fairness_note": fairness_note,
+            "score": score,
         })
+
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values(["eligible", "score", "substitute_count", "daily_load", "teacher"], ascending=[False, True, True, True, True]).reset_index(drop=True)
+    return out.sort_values(
+        ["eligible", "weekly_sub_count", "daily_sub_count", "substitute_count", "daily_load", "score", "teacher"],
+        ascending=[False, True, True, True, True, True, True],
+    ).reset_index(drop=True)
+
