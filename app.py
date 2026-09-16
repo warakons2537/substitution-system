@@ -11,7 +11,7 @@ import streamlit as st
 
 from database import (
     COLS, ROLE_LABELS, academic_year_bounds, audit_df, authenticate_user, change_own_password,
-    clear_sample_records, create_user, database_kind, delete_records, df_all, get_settings,
+    clear_sample_records, create_user, database_kind, delete_records, delete_import_batches, df_all, get_settings,
     has_permission, imported_files_df, init_db, insert_records, is_file_imported, list_users_df,
     make_portable_backup_bytes, migrate_v3_payload, read_v3_sqlite_bytes, reset_user_password,
     restore_portable_backup_bytes, safe_database_url, set_settings, term_bounds, thai_academic_year,
@@ -24,7 +24,7 @@ from report_engine import docx_bytes_to_pdf, make_excel, make_substitution_docx,
 from storage import load_file, storage_status, store_file
 from timetable_engine import parse_timetable_file
 
-APP_VERSION = "4.2.2 Teacher Management"
+APP_VERSION = "4.2.4 Flexible Delete"
 THAI_MONTHS = {
     0: "ทุกเดือน", 1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน",
     5: "พฤษภาคม", 6: "มิถุนายน", 7: "กรกฎาคม", 8: "สิงหาคม",
@@ -515,16 +515,41 @@ elif page == "ช่วยจัดครูสอนแทน":
                     c3.metric("คำแนะนำอันดับ 1", eligible.iloc[0]["teacher"] if not eligible.empty else "ไม่มี")
 
                     show = ranked.rename(columns={
-                        "teacher": "ครู", "status": "สถานะ", "substitute_count": "สอนแทนสะสม",
-                        "daily_load": "คาบสอนวันนี้", "subject_match": "ความถนัด",
+                        "teacher": "ครู",
+                        "status": "สถานะ",
+                        "weekly_sub_count": "สอนแทนสัปดาห์นี้",
+                        "daily_sub_count": "สอนแทนวันนี้",
+                        "monthly_sub_count": "สอนแทนเดือนนี้",
+                        "substitute_count": "สอนแทนสะสม",
+                        "daily_load": "คาบสอนวันนี้",
+                        "subject_match": "ความถนัด",
+                        "last_sub_date": "สอนแทนล่าสุด",
+                        "fairness_note": "รายละเอียดความเป็นธรรม",
                     })
                     st.dataframe(
-                        show[["ครู", "สถานะ", "สอนแทนสะสม", "คาบสอนวันนี้", "ความถนัด"]],
+                        show[[
+                            "ครู", "สถานะ", "สอนแทนสัปดาห์นี้", "สอนแทนวันนี้",
+                            "สอนแทนเดือนนี้", "สอนแทนสะสม", "คาบสอนวันนี้",
+                            "ความถนัด", "สอนแทนล่าสุด", "รายละเอียดความเป็นธรรม",
+                        ]],
                         use_container_width=True, hide_index=True,
                     )
 
                     if not eligible.empty:
-                        st.caption("ระบบเรียงจากจำนวนสอนแทนสะสมน้อยก่อน จากนั้นดูภาระสอนในวันนั้น และให้โบนัสเล็กน้อยกับครูที่เคยสอนวิชาเดียวกัน")
+                        top = eligible.iloc[0]
+                        st.info(
+                            f"คำแนะนำอันดับ 1: **{top['teacher']}** — "
+                            f"สัปดาห์นี้สอนแทน {int(top['weekly_sub_count'])} ครั้ง, "
+                            f"วันนี้ {int(top['daily_sub_count'])} ครั้ง, "
+                            f"สะสม {int(top['substitute_count'])} ครั้ง, "
+                            f"คาบสอนประจำวันนี้ {int(top['daily_load'])} คาบ"
+                            + (" และตรงวิชา" if str(top.get('subject_match', '')) else "")
+                        )
+                        st.caption(
+                            "หลักการเรียง: ครูที่สอนแทนน้อยกว่าในสัปดาห์ปัจจุบันจะได้ลำดับก่อน "
+                            "จากนั้นจึงพิจารณาจำนวนสอนแทนวันนี้ ยอดสะสม ภาระสอนประจำวันนี้ และความตรงวิชา "
+                            "ระบบไม่ตัดสิทธิ์อัตโนมัติเพียงเพราะสอนแทนหลายครั้ง แต่จะลดลำดับและแสดงเหตุผลให้ผู้ใช้ตัดสินใจ"
+                        )
                         # Step 3 is a form too; selecting teacher/leave type does not trigger rerun.
                         with st.form("assist_step3", clear_on_submit=False):
                             pick = st.selectbox("เลือกครูผู้สอนแทน", eligible["teacher"].tolist(), key="assist_pick_v421")
@@ -857,13 +882,47 @@ elif page == "ข้อมูลทั้งหมด":
     ]
     st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True, hide_index=True)
     if not df.empty and has_permission(role, "delete"):
-        with st.expander("ลบรายการที่บันทึกผิด"):
-            ids = st.multiselect("เลือก ID ที่ต้องการลบ", df["id"].astype(int).tolist())
-            confirm = st.checkbox("ยืนยันว่าต้องการลบรายการที่เลือก")
-            if st.button("ลบรายการ", disabled=not (ids and confirm)):
-                n = delete_records(ids, username=username)
-                st.success(f"ลบแล้ว {n} รายการ")
-                st.rerun()
+        with st.expander("🗑️ ลบข้อมูลแบบยืดหยุ่น", expanded=False):
+            st.caption("ลบได้ทั้งบางรายการหรือหลายรายการพร้อมกัน โดยประวัติ Audit Log จะยังคงอยู่")
+            del_tab1, del_tab2 = st.tabs(["เลือกลบหลายรายการ", "ลบทั้งหมดที่กำลังแสดง"])
+
+            with del_tab1:
+                id_options = df["id"].astype(int).tolist()
+                ids = st.multiselect(
+                    "เลือก ID ที่ต้องการลบ (เลือกได้หลายรายการ)", id_options, key="bulk_record_ids"
+                )
+                if ids:
+                    preview = df[df["id"].astype(int).isin(ids)]
+                    st.dataframe(
+                        preview[[c for c in ["id", "date_iso", "absent_teacher", "period", "subject", "class_name", "substitute_teacher", "source_file"] if c in preview.columns]],
+                        use_container_width=True, hide_index=True,
+                    )
+                confirm = st.checkbox(
+                    f"ยืนยันลบ {len(ids)} รายการที่เลือก", value=False, key="bulk_record_confirm"
+                )
+                if st.button("ลบรายการที่เลือก", disabled=not (ids and confirm), key="bulk_record_delete"):
+                    n = delete_records(ids, username=username)
+                    cached_records_df.clear() if "cached_records_df" in globals() else None
+                    st.success(f"ลบแล้ว {n} รายการ")
+                    st.rerun()
+
+            with del_tab2:
+                st.warning(
+                    f"ขณะนี้ตารางด้านบนกำลังแสดง {len(df)} รายการ หากกดลบทั้งหมด ระบบจะลบเฉพาะผลลัพธ์ที่กำลังแสดงหลังการค้นหา/กรอง ไม่ได้ลบทั้งฐานโดยอัตโนมัติ"
+                )
+                confirm_text = st.text_input(
+                    'พิมพ์คำว่า "ลบทั้งหมด" เพื่อยืนยัน', key="delete_visible_confirm"
+                )
+                if st.button(
+                    f"ลบทั้งหมดที่กำลังแสดง ({len(df)} รายการ)",
+                    type="secondary",
+                    disabled=(confirm_text.strip() != "ลบทั้งหมด" or df.empty),
+                    key="delete_visible_btn",
+                ):
+                    n = delete_records(df["id"].astype(int).tolist(), username=username)
+                    cached_records_df.clear() if "cached_records_df" in globals() else None
+                    st.success(f"ลบแล้ว {n} รายการ")
+                    st.rerun()
 
 
 elif page == "นำเข้า / ส่งออก":
@@ -923,6 +982,42 @@ elif page == "นำเข้า / ส่งออก":
     with tab_map["ประวัติไฟล์"]:
         hist = imported_files_df()
         st.dataframe(hist, use_container_width=True, hide_index=True)
+
+        if not hist.empty and has_permission(role, "delete"):
+            with st.expander("🗑️ ลบชุดข้อมูลที่นำเข้าผิด", expanded=False):
+                st.info(
+                    "เหมาะสำหรับกรณีแนบเอกสาร/ตารางสอนแทนผิด: เลือกไฟล์นำเข้าหนึ่งไฟล์หรือหลายไฟล์ แล้วลบข้อมูลทั้งหมดที่มาจากไฟล์เหล่านั้นในครั้งเดียว"
+                )
+                hash_choices = hist["file_hash"].astype(str).tolist()
+                selected_hashes = st.multiselect(
+                    "เลือกไฟล์นำเข้าที่ต้องการลบ (เลือกได้หลายไฟล์)",
+                    hash_choices,
+                    format_func=lambda h: str(hist.loc[hist["file_hash"].astype(str) == h, "file_name"].iloc[0]),
+                    key="delete_import_batches_hashes",
+                )
+                if selected_hashes:
+                    selected_hist = hist[hist["file_hash"].astype(str).isin(selected_hashes)].copy()
+                    cols = [c for c in ["file_name", "imported_at", "imported_rows", "import_method", "uploaded_by"] if c in selected_hist.columns]
+                    st.dataframe(selected_hist[cols], use_container_width=True, hide_index=True)
+                    expected_rows = int(pd.to_numeric(selected_hist.get("imported_rows", 0), errors="coerce").fillna(0).sum()) if "imported_rows" in selected_hist.columns else 0
+                    st.warning(
+                        f"กำลังจะลบ {len(selected_hashes)} ชุดนำเข้า (ประวัติระบุรวมประมาณ {expected_rows} รายการ) การลบนี้จะลบ records ที่มาจากไฟล์เหล่านี้และลบรายการในประวัติไฟล์ แต่ Audit Log จะยังอยู่"
+                    )
+                batch_confirm = st.text_input(
+                    'พิมพ์คำว่า "ลบชุดนำเข้า" เพื่อยืนยัน', key="delete_import_batches_confirm"
+                )
+                if st.button(
+                    "ลบชุดนำเข้าที่เลือก",
+                    type="secondary",
+                    disabled=(not selected_hashes or batch_confirm.strip() != "ลบชุดนำเข้า"),
+                    key="delete_import_batches_btn",
+                ):
+                    result = delete_import_batches(selected_hashes, username=username)
+                    st.success(
+                        f"ลบแล้ว {result['batches']} ชุดนำเข้า และลบข้อมูลสอนแทนที่เกี่ยวข้อง {result['records']} รายการ"
+                    )
+                    st.rerun()
+
         if not hist.empty and "storage_key" in hist.columns:
             candidates = hist[hist["storage_key"].fillna("").astype(str).str.strip().ne("")]
             if not candidates.empty:
@@ -1141,4 +1236,3 @@ elif page == "บัญชีของฉัน":
                 st.success("เปลี่ยนรหัสผ่านเรียบร้อย")
             except Exception as exc:
                 st.error(str(exc))
-
