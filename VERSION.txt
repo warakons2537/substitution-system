@@ -1,2 +1,2 @@
-4.1 FreeCloud
+4.2.5 Easy Open
 Streamlit Community Cloud + Supabase PostgreSQL/Storage

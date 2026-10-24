@@ -9,7 +9,25 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from database import (
+
+def _load_secrets_into_env() -> None:
+    """Copy Streamlit Secrets into environment variables BEFORE database.py is imported.
+
+    database.py reads DATABASE_URL etc. via os.getenv() at import time. Streamlit Community Cloud
+    already exports root-level secrets as env vars, but a local run with .streamlit/secrets.toml
+    does not — without this, a local run silently falls back to an empty SQLite file.
+    """
+    try:
+        for key, value in st.secrets.items():
+            if isinstance(value, (str, int, float, bool)) and not os.getenv(str(key)):
+                os.environ[str(key)] = str(value)
+    except Exception:
+        pass  # no secrets.toml → use real env vars / local SQLite
+
+
+_load_secrets_into_env()
+
+from database import (  # noqa: E402
     COLS, ROLE_LABELS, academic_year_bounds, audit_df, authenticate_user, change_own_password,
     clear_sample_records, create_user, database_kind, delete_records, delete_import_batches, df_all, get_settings,
     has_permission, imported_files_df, init_db, insert_records, is_file_imported, list_users_df,
@@ -19,12 +37,12 @@ from database import (
     recommend_substitutes, add_unavailability, delete_unavailability, unavailability_df,
     teacher_status_df, inactive_teachers, set_teacher_active, delete_teacher_current_data,
 )
-from parser_engine import file_sha256, libreoffice_status, parse_document, tesseract_status
-from report_engine import docx_bytes_to_pdf, make_excel, make_substitution_docx, thai_date_long
-from storage import load_file, storage_status, store_file
-from timetable_engine import parse_timetable_file
+from parser_engine import file_sha256, libreoffice_status, parse_document, tesseract_status  # noqa: E402
+from report_engine import docx_bytes_to_pdf, make_excel, make_substitution_docx, thai_date_long  # noqa: E402
+from storage import load_file, storage_status, store_file  # noqa: E402
+from timetable_engine import parse_timetable_file  # noqa: E402
 
-APP_VERSION = "4.2.4 Flexible Delete"
+APP_VERSION = "4.2.5 Easy Open"
 THAI_MONTHS = {
     0: "ทุกเดือน", 1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน",
     5: "พฤษภาคม", 6: "มิถุนายน", 7: "กรกฎาคม", 8: "สิงหาคม",
@@ -149,7 +167,7 @@ def login_screen() -> None:
             with st.form("login_form"):
                 username = st.text_input("ชื่อผู้ใช้")
                 password = st.text_input("รหัสผ่าน", type="password")
-                ok = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
+                ok = st.form_submit_button("เข้าสู่ระบบ", type="primary", width="stretch")
             if ok:
                 user = authenticate_user(username, password)
                 if user:
@@ -171,9 +189,27 @@ st.set_page_config(page_title="ระบบนับการสอนแทน 
 try:
     init_db()
 except Exception as exc:
+    msg = str(exc)
+    low = msg.lower()
     st.error("ยังเชื่อมต่อ/ตั้งค่าฐานข้อมูลไม่สำเร็จ")
-    st.code(str(exc))
-    st.info("ถ้า Deploy บน Streamlit Community Cloud ให้ตรวจ DATABASE_URL และ BOOTSTRAP_ADMIN_PASSWORD ใน App settings → Secrets")
+    if "bootstrap_admin_password" in low:
+        st.info("ยังไม่ได้ตั้งรหัส Admin: ไปที่ Streamlit → App settings → Secrets แล้วเพิ่ม BOOTSTRAP_ADMIN_PASSWORD")
+    elif "password authentication failed" in low:
+        st.info("รหัสผ่านฐานข้อมูลใน DATABASE_URL ไม่ถูกต้อง — ตรวจรหัสใน Streamlit Secrets ให้ตรงกับ Database Password ของ Supabase")
+    else:
+        st.warning(
+            "**สาเหตุที่พบบ่อยที่สุด: Supabase (ฐานข้อมูลฟรี) ถูกพักไว้ เพราะไม่มีคนใช้เกิน 7 วัน**\n\n"
+            "วิธีแก้ (ข้อมูลไม่หาย):\n"
+            "1. เข้า https://supabase.com/dashboard แล้ว Login\n"
+            "2. คลิกโปรเจกต์ของระบบนี้ → กดปุ่ม **Resume project** / **Restore project**\n"
+            "3. รอ 2–5 นาทีจนสถานะเป็นสีเขียว แล้วกลับมากด **Rerun** หรือรีเฟรชหน้านี้\n\n"
+            "ถ้ายังไม่ได้: ตรวจ DATABASE_URL ใน Streamlit → App settings → Secrets "
+            "(ใช้ Session pooler พอร์ต 5432 และมี ?sslmode=require)"
+        )
+        if st.button("ลองเชื่อมต่อใหม่", type="primary"):
+            st.rerun()
+    with st.expander("รายละเอียดข้อผิดพลาด (สำหรับผู้ดูแล)"):
+        st.code(msg)
     st.stop()
 st.markdown(
     """
@@ -244,7 +280,7 @@ with st.sidebar:
     st.caption(f"{ROLE_LABELS.get(role, role)} · @{username}")
     page = st.radio("เมนู", menu, label_visibility="collapsed")
     st.divider()
-    if st.button("ออกจากระบบ", use_container_width=True):
+    if st.button("ออกจากระบบ", width="stretch"):
         st.session_state.user = None
         st.rerun()
     st.caption("Word / PDF / PDF สแกน OCR · Supabase PostgreSQL · Multi-user")
@@ -346,7 +382,7 @@ if page == "อัปโหลด Word/PDF":
             if c not in preview.columns:
                 preview[c] = ""
         edited = st.data_editor(
-            preview[show_cols], use_container_width=True, hide_index=True, num_rows="fixed",
+            preview[show_cols], width="stretch", hide_index=True, num_rows="fixed",
             disabled=["source_file", "confidence"],
             column_config={
                 "source_file": "ไฟล์", "date_iso": "วันที่ (YYYY-MM-DD)", "absent_teacher": "ครูประจำวิชา/คนลา",
@@ -414,7 +450,7 @@ elif page == "ช่วยจัดครูสอนแทน":
             ay = c2.number_input("ปีการศึกษา (พ.ศ.)", min_value=2500, max_value=2700, value=int(default_ay), step=1, key="assist_ay_v421")
             term = c3.selectbox("ภาคเรียน", [1, 2], key="assist_term_v421", format_func=lambda x: f"ภาคเรียนที่ {x}")
             absent = st.selectbox("ครูที่ไม่สามารถเข้าสอนได้", [""] + teacher_choices, key="assist_absent_v421")
-            find_periods = st.form_submit_button("1) ค้นหาคาบของครู", type="primary", use_container_width=True)
+            find_periods = st.form_submit_button("1) ค้นหาคาบของครู", type="primary", width="stretch")
 
         if find_periods:
             st.session_state.pop("assist_ranked_v421", None)
@@ -476,7 +512,7 @@ elif page == "ช่วยจัดครูสอนแทน":
                     manual_subject = cc2.text_input("วิชา", key="assist_subject_manual_v421")
                     manual_class = cc3.text_input("ชั้น", key="assist_class_manual_v421")
                     chosen_label = ""
-                find_subs = st.form_submit_button("2) ค้นหาครูว่าง", type="primary", use_container_width=True)
+                find_subs = st.form_submit_button("2) ค้นหาครูว่าง", type="primary", width="stretch")
 
             if find_subs:
                 if own_rows:
@@ -532,7 +568,7 @@ elif page == "ช่วยจัดครูสอนแทน":
                             "สอนแทนเดือนนี้", "สอนแทนสะสม", "คาบสอนวันนี้",
                             "ความถนัด", "สอนแทนล่าสุด", "รายละเอียดความเป็นธรรม",
                         ]],
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                     if not eligible.empty:
@@ -557,7 +593,7 @@ elif page == "ช่วยจัดครูสอนแทน":
                             note = st.text_input("หมายเหตุ", value="ทำใบงาน", key="assist_note_v421")
                             save_ok = st.form_submit_button(
                                 "3) ยืนยันและบันทึกการสอนแทน",
-                                type="primary", use_container_width=True,
+                                type="primary", width="stretch",
                                 disabled=not has_permission(role, "manual"),
                             )
                         if not has_permission(role, "manual"):
@@ -585,7 +621,7 @@ elif page == "ช่วยจัดครูสอนแทน":
         else:
             st.write("รองรับไฟล์ต้นฉบับรูปแบบ `.xlsm` นี้โดยตรง ระบบอ่านค่าที่บันทึกไว้จากชีต `ข้อมูลครูผู้สอน` และ `ลงตาราง` โดยไม่แกะรหัส VBA")
             c1, c2 = st.columns(2)
-            imp_ay = c1.number_input("ปีการศึกษา", min_value=2500, max_value=2700, value=int(today_th().year + 543), step=1, key="tt_imp_ay")
+            imp_ay = c1.number_input("ปีการศึกษา", min_value=2500, max_value=2700, value=int(thai_academic_year(today_th(), settings.get("academic_year_start", "05-01"))), step=1, key="tt_imp_ay")
             imp_term = c2.selectbox("ภาคเรียน", [1, 2], key="tt_imp_term", format_func=lambda x: f"ภาคเรียนที่ {x}")
             tt_file = st.file_uploader("เลือกไฟล์ตารางสอน", type=["xlsm", "xlsx", "xls"], key="tt_file")
             if tt_file is not None and st.button("1) อ่านและตรวจสอบตารางสอน", type="primary", key="tt_read"):
@@ -623,7 +659,7 @@ elif page == "ช่วยจัดครูสอนแทน":
                 pdf = pd.DataFrame(preview.get("entries", []))
                 if not pdf.empty:
                     display = pdf.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู", "teacher_slot":"ครูคนที่"})
-                    st.dataframe(display[["วัน", "คาบ", "ชั้น", "วิชา", "ครู", "ครูคนที่"]].head(300), use_container_width=True, hide_index=True)
+                    st.dataframe(display[["วัน", "คาบ", "ชั้น", "วิชา", "ครู", "ครูคนที่"]].head(300), width="stretch", hide_index=True)
                 warnings = preview.get("warnings", [])
                 if warnings:
                     with st.expander(f"คำเตือน {len(warnings)} รายการ"):
@@ -644,7 +680,7 @@ elif page == "ช่วยจัดครูสอนแทน":
             hist = timetable_imports_df()
             if not hist.empty:
                 st.markdown("#### ประวัตินำเข้าตารางสอน")
-                st.dataframe(hist[[c for c in ["file_name", "academic_year", "term", "row_count", "teacher_count", "imported_at", "uploaded_by"] if c in hist.columns]], use_container_width=True, hide_index=True)
+                st.dataframe(hist[[c for c in ["file_name", "academic_year", "term", "row_count", "teacher_count", "imported_at", "uploaded_by"] if c in hist.columns]], width="stretch", hide_index=True)
 
     with tab_unavailable:
         teacher_choices = cached_teacher_choices()
@@ -667,7 +703,7 @@ elif page == "ช่วยจัดครูสอนแทน":
         else:
             show = ua.copy()
             show["ช่วงเวลา"] = show["period"].apply(lambda x: "ทั้งวัน" if int(x or 0) == 0 else f"คาบ {int(x)}")
-            st.dataframe(show[["id", "teacher", "ช่วงเวลา", "reason", "created_by"]], use_container_width=True, hide_index=True)
+            st.dataframe(show[["id", "teacher", "ช่วงเวลา", "reason", "created_by"]], width="stretch", hide_index=True)
             if has_permission(role, "timetable"):
                 ids = st.multiselect("เลือก ID ที่ต้องการลบ", show["id"].astype(int).tolist(), key="ua_del_ids")
                 if st.button("ลบรายการที่เลือก", disabled=not ids, key="ua_del"):
@@ -704,14 +740,14 @@ elif page == "ช่วยจัดครูสอนแทน":
                         if not hit.empty:
                             note = str(hit.iloc[0].get("note") or "")
                     rows.append({"ครู": name, "สถานะ": "ใช้งาน" if active else "ย้าย/ปิดใช้งาน", "รายการในตารางสอน": tt_count, "หมายเหตุ": note})
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
                 with st.form("teacher_status_form", clear_on_submit=False):
                     selected_teacher = st.selectbox("เลือกครู", names, key="teacher_manage_name")
                     action = st.radio("การดำเนินการ", ["ปิดใช้งาน (แนะนำสำหรับครูย้าย)", "เปิดใช้งานอีกครั้ง"], horizontal=True)
                     note = st.text_input("หมายเหตุ", placeholder="เช่น ย้ายโรงเรียน 1 ต.ค. 2569")
                     confirm = st.checkbox("ฉันยืนยันการเปลี่ยนสถานะครูรายนี้")
-                    status_ok = st.form_submit_button("บันทึกสถานะ", type="primary", disabled=not confirm, use_container_width=True)
+                    status_ok = st.form_submit_button("บันทึกสถานะ", type="primary", disabled=not confirm, width="stretch")
                 if status_ok:
                     make_active = action == "เปิดใช้งานอีกครั้ง"
                     set_teacher_active(selected_teacher, make_active, note, username=username)
@@ -745,7 +781,7 @@ elif page == "ช่วยจัดครูสอนแทน":
             if vday != "ทั้งหมด":
                 view = view[view["weekday"] == vday]
             show = view.rename(columns={"weekday":"วัน", "period":"คาบ", "class_name":"ชั้น", "subject":"วิชา", "teacher":"ครู"})
-            st.dataframe(show[["วัน", "คาบ", "ชั้น", "วิชา", "ครู"]], use_container_width=True, hide_index=True)
+            st.dataframe(show[["วัน", "คาบ", "ชั้น", "วิชา", "ครู"]], width="stretch", hide_index=True)
 
 
 elif page == "แดชบอร์ด":
@@ -766,17 +802,17 @@ elif page == "แดชบอร์ด":
         t1, t2, t3, t4 = st.tabs(["ผู้สอนแทน", "คนลา", "วิชา", "แนวโน้มรายเดือน"])
         with t1:
             by_teacher = filtered.groupby("substitute_teacher").size().reset_index(name="จำนวนคาบ").sort_values("จำนวนคาบ", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_teacher, use_container_width=True, hide_index=True)
+            st.dataframe(by_teacher, width="stretch", hide_index=True)
             if not by_teacher.empty:
                 st.bar_chart(by_teacher.set_index("substitute_teacher"))
         with t2:
             by_absent = filtered.groupby("absent_teacher").size().reset_index(name="จำนวนคาบที่มีผู้สอนแทน").sort_values("จำนวนคาบที่มีผู้สอนแทน", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_absent, use_container_width=True, hide_index=True)
+            st.dataframe(by_absent, width="stretch", hide_index=True)
             if not by_absent.empty:
                 st.bar_chart(by_absent.set_index("absent_teacher"))
         with t3:
             by_subject = filtered.groupby("subject").size().reset_index(name="จำนวนคาบ").sort_values("จำนวนคาบ", ascending=False) if not filtered.empty else pd.DataFrame()
-            st.dataframe(by_subject, use_container_width=True, hide_index=True)
+            st.dataframe(by_subject, width="stretch", hide_index=True)
         with t4:
             if filtered.empty:
                 st.info("ไม่มีข้อมูลในช่วงที่เลือก")
@@ -785,7 +821,7 @@ elif page == "แดชบอร์ด":
                 trend["เดือน"] = pd.to_datetime(trend["date_iso"]).dt.to_period("M").astype(str)
                 trend = trend.groupby("เดือน").size().reset_index(name="จำนวนคาบ")
                 st.line_chart(trend.set_index("เดือน"))
-                st.dataframe(trend, use_container_width=True, hide_index=True)
+                st.dataframe(trend, width="stretch", hide_index=True)
 
         if has_permission(role, "export"):
             st.download_button(
@@ -818,7 +854,7 @@ elif page == "รายงาน / พิมพ์":
             c3.metric("ผู้สอนแทน", report_df["substitute_teacher"].nunique())
             st.dataframe(
                 report_df[["period", "subject", "class_name", "substitute_teacher", "acknowledged", "note"]],
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
             docx_bytes = make_substitution_docx(report_df, selected_date, absent, settings)
             fname_base = f"บันทึกการสอนแทน_{selected_date.isoformat()}_{absent}".replace("/", "-")
@@ -880,7 +916,7 @@ elif page == "ข้อมูลทั้งหมด":
         "id", "date_iso", "absent_teacher", "leave_type", "period", "subject", "class_name",
         "substitute_teacher", "note", "source_file", "confidence", "created_by", "imported_at",
     ]
-    st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True, hide_index=True)
+    st.dataframe(df[[c for c in display_cols if c in df.columns]], width="stretch", hide_index=True)
     if not df.empty and has_permission(role, "delete"):
         with st.expander("🗑️ ลบข้อมูลแบบยืดหยุ่น", expanded=False):
             st.caption("ลบได้ทั้งบางรายการหรือหลายรายการพร้อมกัน โดยประวัติ Audit Log จะยังคงอยู่")
@@ -895,7 +931,7 @@ elif page == "ข้อมูลทั้งหมด":
                     preview = df[df["id"].astype(int).isin(ids)]
                     st.dataframe(
                         preview[[c for c in ["id", "date_iso", "absent_teacher", "period", "subject", "class_name", "substitute_teacher", "source_file"] if c in preview.columns]],
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
                 confirm = st.checkbox(
                     f"ยืนยันลบ {len(ids)} รายการที่เลือก", value=False, key="bulk_record_confirm"
@@ -960,7 +996,7 @@ elif page == "นำเข้า / ส่งออก":
                         old["confidence"] = "นำเข้าจาก Excel"
                         old["import_method"] = "excel-migration"
                         old = old[old["substitute_teacher"].astype(str).str.strip().ne("")]
-                        st.dataframe(old, use_container_width=True, hide_index=True)
+                        st.dataframe(old, width="stretch", hide_index=True)
                         if st.button("ยืนยันนำเข้า Excel", type="primary"):
                             recs = [normalize_record(r) for r in old.fillna("").to_dict("records")]
                             added, skipped = insert_records(
@@ -981,7 +1017,7 @@ elif page == "นำเข้า / ส่งออก":
 
     with tab_map["ประวัติไฟล์"]:
         hist = imported_files_df()
-        st.dataframe(hist, use_container_width=True, hide_index=True)
+        st.dataframe(hist, width="stretch", hide_index=True)
 
         if not hist.empty and has_permission(role, "delete"):
             with st.expander("🗑️ ลบชุดข้อมูลที่นำเข้าผิด", expanded=False):
@@ -998,7 +1034,7 @@ elif page == "นำเข้า / ส่งออก":
                 if selected_hashes:
                     selected_hist = hist[hist["file_hash"].astype(str).isin(selected_hashes)].copy()
                     cols = [c for c in ["file_name", "imported_at", "imported_rows", "import_method", "uploaded_by"] if c in selected_hist.columns]
-                    st.dataframe(selected_hist[cols], use_container_width=True, hide_index=True)
+                    st.dataframe(selected_hist[cols], width="stretch", hide_index=True)
                     expected_rows = int(pd.to_numeric(selected_hist.get("imported_rows", 0), errors="coerce").fillna(0).sum()) if "imported_rows" in selected_hist.columns else 0
                     st.warning(
                         f"กำลังจะลบ {len(selected_hashes)} ชุดนำเข้า (ประวัติระบุรวมประมาณ {expected_rows} รายการ) การลบนี้จะลบ records ที่มาจากไฟล์เหล่านี้และลบรายการในประวัติไฟล์ แต่ Audit Log จะยังอยู่"
@@ -1161,7 +1197,7 @@ elif page == "ผู้ใช้งาน / Audit":
         show = udf.copy()
         if not show.empty:
             show["role_name"] = show["role"].map(ROLE_LABELS).fillna(show["role"])
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
 
     with t2:
         st.markdown("#### สร้างผู้ใช้ใหม่")
@@ -1212,7 +1248,7 @@ elif page == "ผู้ใช้งาน / Audit":
     with t3:
         limit = st.selectbox("จำนวนรายการล่าสุด", [100, 500, 1000, 5000], index=1)
         adf = audit_df(limit)
-        st.dataframe(adf, use_container_width=True, hide_index=True)
+        st.dataframe(adf, width="stretch", hide_index=True)
         if not adf.empty:
             st.download_button("ดาวน์โหลด Audit Log CSV", adf.to_csv(index=False).encode("utf-8-sig"), "audit_log.csv", "text/csv")
 

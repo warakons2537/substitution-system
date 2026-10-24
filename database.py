@@ -37,8 +37,11 @@ if DATABASE_URL.startswith("sqlite:"):
 elif DATABASE_URL.startswith("postgresql"):
     # Keep a small pool: friendly to Supabase Free / shared pooler limits.
     engine_kwargs.update(pool_size=3, max_overflow=2, pool_recycle=300, pool_timeout=15)
+    # connect_timeout: fail fast (instead of a blank spinning page) when Supabase is paused/unreachable.
+    connect_args = {"connect_timeout": 10}
     if "supabase.com" in DATABASE_URL and "sslmode=" not in DATABASE_URL:
-        engine_kwargs["connect_args"] = {"sslmode": "require", "connect_timeout": 10}
+        connect_args["sslmode"] = "require"
+    engine_kwargs["connect_args"] = connect_args
 ENGINE = create_engine(DATABASE_URL, future=True, **engine_kwargs)
 metadata = MetaData()
 
@@ -876,7 +879,7 @@ def delete_teacher_current_data(teacher: str, username: str = "system") -> dict:
     teacher = str(teacher or "").strip()
     if not teacher:
         return {"timetable": 0, "unavailability": 0}
-    today = date.today().isoformat()
+    today = today_th().isoformat()
     with ENGINE.begin() as con:
         r1 = con.execute(delete(timetable_entries).where(timetable_entries.c.teacher == teacher))
         r2 = con.execute(delete(teacher_unavailability).where(
